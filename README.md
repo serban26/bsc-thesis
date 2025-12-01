@@ -1,6 +1,6 @@
 # SDN Round-Robin Load Balancer (Sticky Sessions)
 
-A compact, research-oriented implementation of a Layer‑3 load balancer built on the Ryu SDN controller and OpenFlow 1.3. The controller accepts traffic to a single Virtual IP (VIP) and transparently forwards connections to a pool of backend servers using a round‑robin policy while preserving session stickiness for existing TCP connections.
+A simple load balancer implemented with the Ryu SDN controller and Mininet, distributing TCP traffic over multiple backend servers using a round-robin policy.
 
 This repository is part of a BSc thesis and includes scripts and a Mininet topology to reproduce experiments locally.
 
@@ -23,7 +23,6 @@ This repository is part of a BSc thesis and includes scripts and a Mininet topol
 - How it works (brief)
 - Development & testing
 - Results
-- License & contact
 
 ---
 
@@ -47,9 +46,18 @@ Prerequisites
 Install Ryu and minimal Python deps:
 
 ```bash
+cd project/root
+
+python3 -m venv .venv # for new venvs, otherwise just activate:
+source .venv/bin/activate
+
+python -V # to check the python version, ideally 3.7
+
 sudo apt update
 sudo apt install -y mininet openvswitch-switch python3-pip
-pip3 install --user ryu eventlet
+pip3 install ryu eventlet
+# OR
+pip install "eventlet==0.30.2" "ryu==4.34"
 ```
 
 Run the project (three terminals recommended)
@@ -68,16 +76,26 @@ ryu-manager controller/rrlb.py
 ```bash
 sudo ./scripts/start_mininet.sh
 # or, to run the custom topology directly
-# sudo mn --custom topo/lb_topo.py --topo lbtopo --controller remote --mac
+sudo -E mn --custom topo/lb_topo.py --topo lb \
+   --controller=remote,ip=127.0.0.1,port=6633 \
+   --switch ovsk,protocols=OpenFlow13
 ```
 
-3) Start backend servers (third terminal) if required by your setup:
+3) Start the servers (in the Mininet terminal):
+
+```bash
+> mininet xterm h1 h2 h3 h4
+
+# h1 is the client host sending http requests
+# h2, h3 and h4 are the backend servers
+```
+4) Start backend servers (h2, h3, h4 in this example):
 
 ```bash
 ./scripts/server.sh
 ```
 
-4) Run client tests / generate load:
+5) Run client tests / generate load:
 
 ```bash
 ./scripts/client_round_robin.sh
@@ -93,14 +111,14 @@ Notes
 
 **Repository layout**
 
-- `controller/rrlb.py` — The Ryu application implementing the round‑robin load balancer with sticky sessions.
-- `topo/lb_topo.py` — Custom Mininet topology used during experiments.
-- `scripts/` — Helper scripts to start the controller, topology, clients and servers:
-   - `start_mininet.sh` — Launches Mininet with the custom topology.
-   - `start_ryu.sh` — Starts the Ryu app (convenience wrapper).
-   - `server.sh` — Starts simple HTTP/echo backends used as pool servers.
-   - `client_round_robin.sh` — Simple client script to exercise the VIP and observe round‑robin behavior.
-- `results/` — Experiment outputs and logs (kept out of version control when large).
+- `controller/rrlb.py` - The Ryu application implementing the round‑robin load balancer with sticky sessions.
+- `topo/lb_topo.py` - Custom Mininet topology used during experiments.
+- `scripts/` - Helper scripts to start the controller, topology, clients and servers:
+   - `start_mininet.sh` - Launches Mininet with the custom topology.
+   - `start_ryu.sh` - Starts the Ryu app (convenience wrapper).
+   - `server.sh` - Starts simple HTTP/echo backends used as pool servers.
+   - `client_round_robin.sh` - Simple client script to exercise the VIP and observe round‑robin behavior.
+- `results/` - Experiment outputs and logs (currently empty).
 
 ---
 
@@ -116,12 +134,8 @@ Notes
 
 **Development notes**
 
-- The code is organized for clarity rather than production performance; it is intended for reproducible experiments and thesis demonstrations.
+- The code is organized for clarity rather than production performance; it is intended for reproducible experiments and  demonstrations.
 - To iterate quickly on `rrlb.py`, run `ryu-manager --verbose controller/rrlb.py` and watch logs for decisions and flow installs.
-
-Suggested improvements (ideas)
-- Add UDP support and health‑checks for backends.
-- Make persistence configurable (cookie timeouts, per‑client policies).
 
 ---
 
@@ -129,12 +143,3 @@ Suggested improvements (ideas)
 
 Collect logs and CSVs in `results/`. The tests in `scripts/` generate simple request traces to observe server rotation and stickiness under retransmissions.
 
----
-
-**License & attribution**
-
-This repository is part of a BSc Thesis. Please contact the author for reuse or redistribution details.
-
-**Contact / Questions**
-
-If you want further polish, automated tests, or a `requirements.txt`/`pyproject.toml`, tell me which you'd like and I will add them.
