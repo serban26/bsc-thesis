@@ -9,6 +9,7 @@ from ryu.lib.packet import ipv4
 from ryu.lib.packet import tcp
 from ryu.lib.packet import arp
 from ryu.lib.packet import ether_types
+import urllib.parse
 
 from controller.online_scheduler import OnlineScheduler
 
@@ -45,12 +46,12 @@ class RoundRobinLB(app_manager.RyuApp):
         )
         dp.send_msg(mod)
 
-    def get_backend_for_session(self, src_ip, src_port):
+    def get_backend_for_session(self, src_ip, src_port, req_info=None):
         key = (src_ip, src_port)
         if key in self.known_sessions:
             return self.known_sessions[key]
-        req, server_model = self.scheduler.assign_for_new_flow()
-        if server_model is None or req.status == "too_consuming":
+        req, server_model = self.scheduler.assign_for_new_flow(req_info=req_info)
+        if server_model is None or req is None or req.status == "too_consuming":
             self.logger.info(
                 "Request from {}:{} marked too_consuming or no server available".format(
                     src_ip, src_port
@@ -71,6 +72,41 @@ class RoundRobinLB(app_manager.RyuApp):
         )
         self.known_sessions[key] = backend
         return backend
+
+    def extract_request_metadata(self, pkt):
+        try:
+            raw_payload = None
+            if getattr(pkt, "protocols", None):
+                last = pkt.protocols[-1]
+                if isinstance(last, (bytes, bytearray)):
+                    raw_payload = last
+            if not raw_payload:
+                return None
+            text = raw_payload.decode("ascii", errors="ignore")
+            first_line = text.split("\r\n", 1)[0]
+            parts = first_line.split()
+            if len(parts) < 2:
+                return None
+            path = parts[1]
+            parsed = urllib.parse.urlparse(path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            name = qs.get("name", [None])[0]
+            mem = qs.get("mem", [None])[0]
+            units = qs.get("units", [None])[0]
+            arrival = qs.get("arrival", [None])[0]
+            if name is None or mem is None or units is None:
+                return None
+            info = {
+                "name": name,
+                "memory_mb": float(mem),
+                "units": float(units),
+            }
+            if arrival is not None:
+                info["arrival_ms"] = int(arrival)
+            return info
+        except Exception as e:
+            self.logger.debug("Failed to parse request metadata: %s", e)
+            return None
 
     def send_arp_reply(self, dp, pkt_arp, in_port):
         parser = dp.ofproto_parser
@@ -146,7 +182,8 @@ class RoundRobinLB(app_manager.RyuApp):
             if ip and ip.dst == self.vip_ip:
                 t = pkt.get_protocol(tcp.tcp)
                 if t and t.dst_port == 80:
-                    backend = self.get_backend_for_session(ip.src, t.src_port)
+                    req_info = self.extract_request_metadata(pkt)
+                    backend = self.get_backend_for_session(ip.src, t.src_port, req_info=req_info)
                     if backend is None:
                         return
                     match_fwd = parser.OFPMatch(

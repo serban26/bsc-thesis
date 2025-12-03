@@ -1,9 +1,9 @@
 name,arrival_ms,server,start_ms,finish_ms,status
-req1,4967,serv1,4967,8967,assigned
-req2,5984,serv2,5984,9984,assigned
-req3,7999,serv3,7999,22999,assigned
-req4,10015,serv1,10015,12015,assigned
-req5,12029,serv2,12029,17029,assigned
-req6,14042,serv3,14042,24042,assigned
-req7,16055,serv1,16055,22055,assigned
-req8,18068,serv2,18068,22068,assigned
+req1,4974,serv1,4974,8974,assigned
+req2,5990,serv2,5990,9990,assigned
+req3,8006,serv3,8006,23006,assigned
+req4,10022,serv1,10022,12022,assigned
+req5,12035,serv2,12035,17035,assigned
+req6,14049,serv3,23006,33006,assigned
+req7,16064,serv1,16064,22064,assigned
+req8,18079,serv2,18079,22079,assigned

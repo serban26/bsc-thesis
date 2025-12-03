@@ -35,7 +35,7 @@ def load_config(path):
         name = parts[0]
         mem = parts[1]
         units = parts[2]
-        if len(parts) >= 4:
+        if len(parts) > 3:
             arrival_ms = int(parts[3])
         else:
             arrival_ms = 0
@@ -44,11 +44,11 @@ def load_config(path):
 
 
 class OnlineScheduler:
-    def __init__(self, config_path="input/input.txt", log_path="results/schedule.csv"):
+    def __init__(self, config_path="input/input.txt", log_path="results/schedule.csv", algorithm=None):
         self.config_path = config_path
         self.log_path = log_path
         self.servers, self.request_templates = load_config(config_path)
-        self.algorithm = RoundRobinAlgorithm()
+        self.algorithm = algorithm or RoundRobinAlgorithm()
         self.start_time = time.time()
         self.next_request_index = 0
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -59,7 +59,15 @@ class OnlineScheduler:
     def now_ms(self):
         return int(round((time.time() - self.start_time) * 1000))
 
-    def next_request(self):
+    def next_request(self, req_info=None):
+        if req_info is not None:
+            name = req_info.get("name") or f"req{self.next_request_index}"
+            memory_mb = req_info.get("memory_mb", 0.0)
+            units = req_info.get("units", 0.0)
+            arrival_ms = req_info.get("arrival_ms", self.now_ms())
+            index = self.next_request_index
+            self.next_request_index += 1
+            return Request(name, memory_mb, units, arrival_ms, index)
         if self.next_request_index >= len(self.request_templates):
             return None
         template = self.request_templates[self.next_request_index]
@@ -68,8 +76,8 @@ class OnlineScheduler:
         req = Request(template.name, template.memory_mb, template.units, arrival_ms, template.index)
         return req
 
-    def assign_for_new_flow(self):
-        req = self.next_request()
+    def assign_for_new_flow(self, req_info=None):
+        req = self.next_request(req_info=req_info)
         if req is None:
             return None, None
         now_ms = req.arrival_ms

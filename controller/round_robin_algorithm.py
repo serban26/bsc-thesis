@@ -16,25 +16,29 @@ class RoundRobinAlgorithm:
         return True
 
     def schedule(self, servers, request: Request, now_ms: int):
-        if not any(self.can_ever_handle(s, request) for s in servers):
-            request.status = "too_consuming"
-            return None
-        num = len(servers)
         chosen = None
-        for k in range(num):
-            idx = (self.rr_index + k) % num
-            s = servers[idx]
-            if self.can_ever_handle(s, request):
-                chosen = s
-                self.rr_index = (idx + 1) % num
-                break
+        num = len(servers)
+        if num == 0:
+            request.status = "no_server"
+            return None
+        for offset in range(num):
+            idx = (self.rr_index + offset) % num
+            s: Server = servers[idx]
+            if not self.can_ever_handle(s, request):
+                continue
+            chosen = s
+            self.rr_index = (idx + 1) % num
+            break
         if chosen is None:
             request.status = "too_consuming"
             return None
+
         now_s = now_ms / 1000.0
-        start_s = now_s
+        start_s = max(now_s, float(chosen.available_at))
         duration_s = request.units / chosen.speed_units_per_s
         finish_s = start_s + duration_s
+        chosen.available_at = finish_s
+
         request.status = "assigned"
         request.assigned_server = chosen.name
         request.start_ms = int(round(start_s * 1000))

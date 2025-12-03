@@ -1,0 +1,5 @@
+algorithm,scope,name,requests,completed,failed,avg_response_ms,avg_wait_ms,busy_ms,idle_ms,utilization,makespan_ms
+Round Robin,global,all_servers,8,8,0,7369.62,1119.62,50000,34096,59.46,28032
+Round Robin,server,serv1,3,3,0,4000.0,0.0,12000,16032,42.81,28032
+Round Robin,server,serv2,3,3,0,4333.33,0.0,13000,15032,46.38,28032
+Round Robin,server,serv3,2,2,0,16978.5,4478.5,25000,3032,89.18,28032
