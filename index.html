@@ -449,6 +449,7 @@
             }
         }
     </style>
+
 </head>
 
 <body>
@@ -458,21 +459,15 @@
     <div class="toolbar">
         <div class="toolbar-left">
             <div class="textarea-wrapper">
-                <div class="textarea-title">input/input.txt</div>
-                <textarea id="input-editor" spellcheck="false"></textarea>
+                <div class="textarea-title">input/input.txt</div> <textarea id="input-editor"
+                    spellcheck="false"></textarea>
             </div>
         </div>
-        <div class="toolbar-right">
-            <button id="save-btn" class="btn-secondary">Save input</button>
-            <button id="run-btn" class="btn-primary">Run experiment</button>
-            <div class="status-row">
-                <span id="spinner" class="spinner hidden"></span>
-                <span id="status-label" class="status-text"><strong>Idle.</strong> Edit input and click Run
-                    experiment.</span>
-            </div>
-            <div class="timeline">
-                <span id="timeline-label"><strong>Sim time:</strong> 0 ms</span>
-            </div>
+        <div class="toolbar-right"> <button id="save-btn" class="btn-secondary">Save input</button> <button id="run-btn"
+                class="btn-primary">Run experiment</button>
+            <div class="status-row"> <span id="spinner" class="spinner hidden"></span> <span id="status-label"
+                    class="status-text"><strong>Idle.</strong> Edit input and click Run experiment.</span> </div>
+            <div class="timeline"> <span id="timeline-label"><strong>Sim time:</strong> 0 ms</span> </div>
             <div class="console-wrapper">
                 <div class="console-title">Output console</div>
                 <div id="log-panel" class="log-panel hidden"></div>
@@ -501,11 +496,7 @@
             </div>
         </div>
     </div>
-    <script>
-        let globalSchedule = [];
-        let globalStats = [];
-        let statusPoll = null;
-
+    <script> let globalSchedule = []; let globalStats = []; let statusPoll = null; let lastRunning = false; let statsReady = false;
         function parseCsv(text) {
             const lines = text.trim().split(/\r?\n/);
             if (!lines.length) return [];
@@ -663,7 +654,7 @@
                 title.textContent = name;
                 const tag = document.createElement("div");
                 tag.className = "algo-tag";
-                if (name === "Round Robin") tag.textContent = "active"; else tag.textContent = "pending";
+                if (name === "Round Robin" && globalStats.length) tag.textContent = "active"; else tag.textContent = "pending";
                 header.appendChild(title);
                 header.appendChild(tag);
                 card.appendChild(header);
@@ -784,6 +775,8 @@
                 fetch("/api/status").then(r => r.json()),
                 fetch("/results/schedule.csv?" + Date.now()).then(r => r.ok ? r.text() : "")
             ]).then(([status, schText]) => {
+                const wasRunning = lastRunning;
+                lastRunning = !!status.running;
                 if (status.running) {
                     setStatus("<strong>Running…</strong> This may take a few seconds.", "running");
                 } else if (status.exit_code != null) {
@@ -801,10 +794,18 @@
                     renderAt(0);
                 }
                 if (status.running) {
-                    statusPoll = setTimeout(refreshState, 500);
+                    statusPoll = setTimeout(refreshState, 1000);
                 } else {
                     statusPoll = null;
-                    loadStats();
+                    if (wasRunning && !status.running && status.exit_code != null) {
+                        statsReady = true;
+                    }
+                    if (statsReady && status.exit_code != null) {
+                        loadStats();
+                    } else {
+                        globalStats = [];
+                        renderStats();
+                    }
                 }
             }).catch(() => {
                 if (statusPoll) {
@@ -822,6 +823,9 @@
                 clearTimeout(statusPoll);
                 statusPoll = null;
             }
+            statsReady = false;
+            globalStats = [];
+            renderStats();
             setStatus("<strong>Running…</strong> This may take a few seconds.", "running");
             appendLog("");
             globalSchedule = [];
@@ -862,12 +866,19 @@
         });
 
         loadInput()
-            .then(() => refreshState())
+            .then(() => {
+                globalStats = [];
+                renderStats();
+                return refreshState();
+            })
             .catch(() => {
                 globalSchedule = [];
                 renderAt(0);
+                globalStats = [];
+                renderStats();
             });
     </script>
+
 </body>
 
 </html>

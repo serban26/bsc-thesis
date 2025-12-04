@@ -30,6 +30,7 @@ class RoundRobinLB(app_manager.RyuApp):
             )
         self.backend_by_name = {b["name"]: b for b in self.backends}
         self.known_sessions = {}
+        self.rejected_sessions = set()
         self.logger.info("--- Load Balancer Starting ---")
 
     def add_flow(self, dp, priority, match, actions, idle=0, hard=0):
@@ -50,6 +51,8 @@ class RoundRobinLB(app_manager.RyuApp):
         key = (src_ip, src_port)
         if key in self.known_sessions:
             return self.known_sessions[key]
+        if key in self.rejected_sessions:
+            return None
         req, server_model = self.scheduler.assign_for_new_flow(req_info=req_info)
         if server_model is None or req is None or req.status == "too_consuming":
             self.logger.info(
@@ -57,9 +60,11 @@ class RoundRobinLB(app_manager.RyuApp):
                     src_ip, src_port
                 )
             )
+            self.rejected_sessions.add(key)
             return None
         backend = self.backend_by_name.get(server_model.name)
         if backend is None:
+            self.rejected_sessions.add(key)
             return None
         self.logger.info(
             "LB DECISION: {} mapped to {} (req {} start {} finish {})".format(

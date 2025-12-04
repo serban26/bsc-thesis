@@ -20,5 +20,6 @@ for i in $(seq 0 $((num_requests - 1))); do
         fi
     fi
     echo "=== request ${req_name} ==="
-    curl --no-keepalive -s -o /dev/null -w "HTTP %{http_code}" "http://10.0.0.100/?name=${req_name}&mem=${mem}&units=${units}&arrival=${arrival_ms}"
+    curl --no-keepalive --max-time 2 --connect-timeout 2 -s -o /dev/null -w "HTTP %{http_code}" "http://10.0.0.100/?name=${req_name}&mem=${mem}&units=${units}&arrival=${arrival_ms}"
+    echo
 done

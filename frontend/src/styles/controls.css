@@ -1,0 +1,98 @@
+.panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+.panel-header h2 {
+    margin: 0;
+    font-size: 1rem;
+}
+
+.input-textarea {
+    width: 100%;
+    min-height: 260px;
+    resize: vertical;
+    border-radius: 0.75rem;
+    border: 1px solid #1f2937;
+    padding: 0.75rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 0.85rem;
+    color: #e5e7eb;
+    background: #020617;
+    outline: none;
+    box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.9);
+}
+
+.input-textarea:focus {
+    border-color: #22c55e;
+    box-shadow: 0 0 0 1px #22c55e;
+}
+
+.toolbar {
+    display: flex;
+    gap: 1rem;
+    align-items: flex-start;
+    flex-wrap: wrap;
+}
+
+.toolbar-left {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.toolbar-right {
+    margin-left: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    min-width: 260px;
+    max-width: 360px;
+}
+
+button {
+    border-radius: 999px;
+    padding: 0.45rem 0.9rem;
+    font-size: 0.82rem;
+    border: 1px solid transparent;
+    background: #1f2937;
+    color: #e5e7eb;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    transition: background 0.15s ease, transform 0.05s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+button.primary {
+    background: linear-gradient(135deg, #22c55e, #4ade80);
+    color: #022c22;
+    box-shadow: 0 12px 30px rgba(34, 197, 94, 0.35);
+    border-color: rgba(34, 197, 94, 0.6);
+}
+
+button.secondary {
+    background: rgba(15, 23, 42, 0.9);
+    border-color: rgba(148, 163, 184, 0.5);
+}
+
+button.ghost {
+    background: transparent;
+    border-color: rgba(148, 163, 184, 0.3);
+    color: #9ca3af;
+}
+
+button:hover:enabled {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 25px rgba(15, 23, 42, 0.9);
+}
+
+button:disabled {
+    opacity: 0.6;
+    cursor: default;
+    box-shadow: none;
+    transform: none;
+}
