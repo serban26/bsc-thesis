@@ -1,0 +1,667 @@
+\documentclass[10pt,a4paper,twocolumn]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{microtype}
+\usepackage[a4paper,margin=1in]{geometry}
+\setlength{\parskip}{0.35em}
+\setlength{\parindent}{0pt}
+\setlength{\columnsep}{0.7cm}
+
+\usepackage{stfloats}
+\usepackage[section]{placeins}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\graphicspath{{results/round_robin/}{results/comparison/}{results/least_connections/}{figures/}}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage[labelfont=bf,font=small]{caption}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric,arrows.meta,positioning,fit,backgrounds}
+
+\numberwithin{figure}{section}
+\numberwithin{table}{section}
+\numberwithin{equation}{section}
+
+\usepackage[numbers,sort&compress]{natbib}
+\bibliographystyle{plainnat}
+
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=blue}
+
+\newcommand{\mydate}[1]{#1}
+
+\begin{filecontents*}{refs.bib}
+@article{mckeown2008openflow,
+  title={OpenFlow: Enabling Innovation in Campus Networks},
+  author={McKeown, Nick and Anderson, Tom and Balakrishnan, Hari and Parulkar, Guru and Peterson, Larry and Rexford, Jennifer and Shenker, Scott and Turner, Jonathan},
+  journal={ACM SIGCOMM Computer Communication Review},
+  volume={38},
+  number={2},
+  pages={69--74},
+  year={2008},
+  doi={10.1145/1355734.1355746}
+}
+@article{kreutz2015sdn,
+  title={Software-Defined Networking: A Comprehensive Survey},
+  author={Kreutz, Diego and Ramos, Fernando M. V. and Ver{\'i}ssimo, Paulo Est{\^e}v{\~a}o and Rothenberg, Christian Esteve and Azodolmolky, Siamak and Uhlig, Steve},
+  journal={Proceedings of the IEEE},
+  volume={103},
+  number={1},
+  pages={14--76},
+  year={2015},
+  doi={10.1109/JPROC.2014.2371999}
+}
+@inproceedings{lantz2010mininet,
+  title={A Network in a Laptop: Rapid Prototyping for Software-Defined Networks},
+  author={Lantz, Bob and Heller, Brandon and McKeown, Nick},
+  booktitle={Proceedings of the 9th ACM SIGCOMM Workshop on Hot Topics in Networks (Hotnets-IX)},
+  year={2010},
+  doi={10.1145/1868447.1868466}
+}
+@online{ryu2023,
+  title={Ryu SDN Framework},
+  author={{Ryu Project Team}},
+  year={2023},
+  url={https://ryu-sdn.org/},
+  urldate={2026-05-08}
+}
+@inproceedings{pfaff2015ovs,
+  title={The Design and Implementation of Open vSwitch},
+  author={Pfaff, Ben and Pettit, Justin and Koponen, Teemu and Jackson, Ethan and Zhou, Andy and Rajahalme, Jarno and Gross, Jesse and Wang, Alex and Stringer, Jonathan and Shelar, Pravin and Amidon, Keith and Casado, Mart{\'i}n},
+  booktitle={12th USENIX Symposium on Networked Systems Design and Implementation (NSDI 15)},
+  pages={117--130},
+  year={2015}
+}
+@article{nunes2014sdn_survey,
+  title={A Survey of Software-Defined Networking: Past, Present, and Future of Programmable Networks},
+  author={Nunes, Bruno Astuto A. and Mendonca, Marc and Nguyen, Xuan-Nam and Obraczka, Katia and Turletti, Thierry},
+  journal={IEEE Communications Surveys \& Tutorials},
+  volume={16},
+  number={3},
+  pages={1617--1634},
+  year={2014},
+  doi={10.1109/SURV.2014.012214.00180}
+}
+@article{wang2011leastconn,
+  title={An Improved Round Robin Scheduling Algorithm for Load Balancing},
+  author={Wang, Ruo-Yu},
+  journal={International Symposium on Information Processing},
+  pages={196--198},
+  year={2011}
+}
+@inproceedings{handigol2009openflow_lb,
+  title={Plug-and-Serve: Load-Balancing with OpenFlow},
+  author={Handigol, Nikhil and Seetharaman, Srinivasan and Flajslik, Mario and McKeown, Nick and Johari, Ramesh},
+  booktitle={ACM SIGCOMM Demo},
+  year={2009}
+}
+@article{zhou2014sdn_lb,
+  title={Load Balancing in Software Defined Networks},
+  author={Zhou, Yaqiong and Chen, Kang and Zhang, Jianfeng and Tang, Shanjiang and Jiang, Yuanhao},
+  journal={IFIP Networking},
+  year={2014}
+}
+@online{of13spec,
+  title={OpenFlow Switch Specification Version 1.3.5},
+  author={{Open Networking Foundation}},
+  year={2015},
+  url={https://opennetworking.org/wp-content/uploads/2014/10/openflow-switch-v1.3.5.pdf},
+  urldate={2026-05-08}
+}
+\end{filecontents*}
+
+\begin{document}
+
+% ── Title page ─────────────────────────────────────────────────────────────
+\begin{titlepage}
+\begin{figure}[h]
+\centering
+\includegraphics[width=\textwidth]{banner.png}
+\end{figure}
+\bigskip
+\bigskip
+\begin{center}
+
+\hrulefill\\
+\Huge{SDN-Based Adaptive Load Balancing:\\
+Implementing and Comparing Scheduling\\
+Algorithms in an Emulated Network}\\
+\bigskip
+\Large{Bachelor's Thesis --- Computing Science}\\
+\bigskip
+\href{https://github.com/serban26/bsc-thesis}{\texttt{GitHub Repository}}\\
+\hrulefill\\
+\vspace{1.0cm}
+\textbf{\Large Author:}\\
+\vspace{0.5cm}
+\textit{Luca Serban (s5616786)}\\
+\vspace{0.75cm}
+\textbf{\Large Supervisor:}\\
+\vspace{0.5cm}
+\textit{[Supervisor name]}\\
+
+\vspace{4cm}
+\mydate{\today}
+
+\end{center}
+\end{titlepage}
+
+% ── Abstract ───────────────────────────────────────────────────────────────
+\begin{abstract}
+Traffic load balancing is one of those problems that sounds simple until you
+actually try to implement it properly. Spreading incoming requests across multiple
+servers is easy in theory --- just take turns --- but doing it in a way that adapts
+to real conditions requires visibility into the network that traditional load balancers
+simply do not have.
+
+This thesis explores an approach based on Software-Defined Networking (SDN).
+By implementing the load-balancing logic inside a programmable network controller,
+we get direct access to active flow counts, port statistics, and per-server health
+metrics in real time. The controller intercepts every new TCP connection, picks a
+backend according to the active algorithm, and transparently rewrites packet headers
+in both directions so the client never has to know which server it is actually talking to.
+
+We implement and compare two algorithms: \textbf{Weighted Round Robin} (WRR),
+which distributes connections in a fixed cyclic order regardless of server state, and
+\textbf{Least Connections} (LC), which always selects the server with the fewest
+active flows relative to its weight. The system is built on Ryu~\citep{ryu2023},
+Mininet~\citep{lantz2010mininet}, and Open vSwitch~\citep{pfaff2015ovs},
+using OpenFlow~1.3~\citep{of13spec} as the control protocol.
+
+To make the comparison meaningful, the three backend servers are given distinct
+processing-time profiles and link-level delays, producing clearly different response
+time distributions. The controller logs per-server metrics continuously, and a set of
+Python scripts generates plots automatically at the end of each experiment.
+
+Results show that both algorithms distribute traffic correctly and that the server
+profiles produce the intended latency variation. The full comparison under concurrent
+load is left as future work, along with an adaptive score-based algorithm that uses
+all collected metrics together.
+
+\bigskip
+\noindent\textbf{Keywords:} Software-Defined Networking, OpenFlow, load balancing,
+Ryu, Mininet, round robin, least connections, network emulation.
+\end{abstract}
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:intro}
+
+\subsection{Motivation}
+
+When a web service gets popular, one server is never enough. The standard solution
+is to put multiple servers behind a single address and distribute the incoming requests
+across them. The component that does this --- the load balancer --- is a surprisingly
+interesting piece of networking infrastructure, because it has to make per-connection
+decisions at high speed while keeping track of which backends are actually available
+and how loaded they are.
+
+The two most common traditional approaches are DNS-based load balancing and dedicated
+hardware appliances. DNS-based balancing works by returning different server addresses
+for the same hostname, spreading clients at the DNS level. It is simple and requires
+no special network equipment, but it is inherently coarse: DNS responses are cached,
+clients cannot be redirected mid-session, and the balancer has no visibility into actual
+server load. Hardware appliances are more capable but are expensive, opaque, and
+difficult to modify.
+
+Software-Defined Networking (SDN) offers a different perspective. The central idea is
+to separate the \emph{control plane} --- the logic deciding where traffic goes --- from
+the \emph{data plane} --- the equipment that actually forwards it
+\citep{mckeown2008openflow, kreutz2015sdn}. The control plane runs as software on a
+standard server (the SDN controller), and the switches become programmable forwarding
+elements that execute rules sent by the controller via a standardised protocol (OpenFlow).
+
+This architecture is a natural fit for load balancing. The controller sees every new
+flow, can read real-time statistics from switches, and installs per-flow rules that
+rewrite packet headers on the fly \citep{handigol2009openflow_lb, zhou2014sdn_lb}.
+Changing the scheduling algorithm means changing a few lines of Python --- no hardware
+involved.
+
+\subsection{Project Overview}
+
+This thesis describes the design and implementation of an SDN-based HTTP load
+balancer. The emulation stack consists of three open-source components:
+
+\begin{itemize}
+\item \textbf{Mininet}~\citep{lantz2010mininet} --- creates virtual hosts and links
+  on a single Linux machine using network namespaces.
+\item \textbf{Open vSwitch (OVS)}~\citep{pfaff2015ovs} --- a software OpenFlow switch
+  that executes flow rules and reports statistics.
+\item \textbf{Ryu}~\citep{ryu2023} --- a Python SDN controller framework.
+\end{itemize}
+
+The system exposes a single \emph{Virtual IP} (VIP, \texttt{10.0.0.100}) to the client.
+The controller intercepts each new TCP connection, picks a backend, and installs a
+bidirectional pair of OpenFlow rules that rewrite headers transparently. Neither the
+client nor the servers require any modification.
+
+Two scheduling algorithms are implemented: \textbf{Weighted Round Robin} selects
+servers in a fixed cyclic order, oblivious to load. \textbf{Least Connections}
+always selects the server with the fewest active connections relative to its weight.
+Comparing them on heterogeneous server profiles is the central question of this work.
+
+\subsection{Research Questions}
+
+\begin{enumerate}
+\item Can an SDN controller implement transparent HTTP load balancing without
+  any changes to client or server code?
+\item Is there a measurable difference in how Round Robin and Least Connections
+  handle backends with different response time profiles?
+\item What metrics does the controller need to make that comparison meaningful?
+\end{enumerate}
+
+The first question has been answered. The infrastructure for questions 2 and 3 is
+fully in place; full comparative analysis under concurrent load is future work.
+
+\subsection{Thesis Structure}
+
+Section~\ref{sec:methods} covers system design. Section~\ref{sec:setup} describes the
+experimental setup. Section~\ref{sec:results} presents results. Section~\ref{sec:discussion}
+discusses them. Section~\ref{sec:conclusion} concludes.
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Methods}
+\label{sec:methods}
+
+\subsection{System Architecture}
+
+The system has three layers: the emulated network (Mininet + OVS), the SDN controller
+(Ryu), and the measurement pipeline (Python scripts). The controller and Mininet run
+as separate OS processes communicating over loopback on TCP port 6633 using
+OpenFlow~1.3~\citep{of13spec}. Figure~\ref{fig:arch} shows the structure.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners=3pt, minimum width=2.4cm,
+              minimum height=0.7cm, align=center, font=\scriptsize},
+  arr/.style={-Stealth, thick},
+  darr/.style={Stealth-Stealth, thick, dashed},
+  layer/.style={draw=gray!40, dashed, rounded corners=5pt, inner sep=5pt}
+]
+  \node[box,fill=blue!12]  (ryu) at (0,0)    {Ryu controller};
+  \node[box,fill=blue!8]   (alg) at (-2.2,0) {Algorithm\\RR / LC};
+  \node[box,fill=blue!8]   (met) at ( 2.2,0) {Metrics\\module};
+  \draw[arr]  (alg) -- (ryu) node[midway,above,font=\tiny]{select()};
+  \draw[darr] (ryu) -- (met) node[midway,above,font=\tiny]{snapshot};
+
+  \node[box,fill=green!12] (ovs) at (0,-1.7) {Open vSwitch\\OF~1.3};
+  \draw[darr] (ryu) -- (ovs) node[midway,right,font=\tiny]{FlowMod/PacketIn};
+
+  \node[box,fill=orange!15](h1) at (-2.8,-3.2){h1 client};
+  \node[box,fill=gray!15]  (h2) at (-0.9,-3.2){h2};
+  \node[box,fill=gray!15]  (h3) at ( 0.9,-3.2){h3};
+  \node[box,fill=gray!15]  (h4) at ( 2.8,-3.2){h4};
+  \foreach \h in {h1,h2,h3,h4} \draw[arr] (ovs) -- (\h);
+  \node[font=\tiny,text=blue!60] at (0,-2.4){VIP 10.0.0.100};
+
+  \begin{scope}[on background layer]
+    \node[layer, fit=(ryu)(alg)(met),
+          label={[gray,font=\scriptsize]above:Control Plane}] {};
+    \node[layer, fit=(ovs),
+          label={[gray,font=\scriptsize]left:Data Plane}] {};
+    \node[layer, fit=(h1)(h2)(h3)(h4),
+          label={[gray,font=\scriptsize]below:Hosts}] {};
+  \end{scope}
+\end{tikzpicture}
+\caption{System architecture. Ryu programs OVS via OpenFlow~1.3. Algorithm and
+  metrics logic live inside the controller process.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Network Topology}
+
+The topology is a single switch (\texttt{s1}) with four hosts: client \texttt{h1} and
+servers \texttt{h2}--\texttt{h4}, all on \texttt{10.0.0.0/24}. The VIP belongs to no
+host; the controller answers its ARP requests. Each link has a distinct delay profile
+via TCLink netem (Table~\ref{tab:links}).
+
+\begin{table}[t]
+\centering
+\caption{Per-link delay profiles (TCLink netem).}
+\label{tab:links}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Link} & \textbf{Base} & \textbf{Jitter} \\
+\midrule
+h1 -- s1 & \SI{2}{ms}  & \SI{1}{ms} \\
+h2 -- s1 & \SI{3}{ms}  & \SI{1}{ms} \\
+h3 -- s1 & \SI{8}{ms}  & \SI{3}{ms} \\
+h4 -- s1 & \SI{15}{ms} & \SI{5}{ms} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Controller Design}
+
+The Ryu application (\texttt{controller/load\_balancer.py}) handles two OpenFlow
+event types.
+
+\paragraph{PacketIn.}
+When no flow rule matches an incoming packet, OVS sends a PacketIn to the controller.
+For ARP to the VIP, the controller replies directly. For TCP/UDP to the VIP, it calls
+the algorithm and installs two flow rules:
+
+\begin{itemize}
+\item \textit{Forward}: (src\_ip, VIP, proto, sport, dport) $\to$ rewrite dst to
+  backend; forward on server port.
+\item \textit{Reverse}: (server\_ip, client\_ip, proto) $\to$ rewrite src back to
+  VIP; forward to client.
+\end{itemize}
+
+Both carry \texttt{OFPFF\_SEND\_FLOW\_REM}, idle timeout \SI{2}{s}, hard timeout
+\SI{60}{s}. A deduplication cache (\texttt{\_pending\_flows}) maps each 5-tuple to
+the server already picked, preventing a race where OVS sends multiple PacketIn events
+for the same TCP handshake before the FlowMod commits ($\approx$\SI{1}{ms}). Without
+it, successive segments could be routed to different backends, breaking the connection.
+
+\paragraph{FlowRemoved.}
+When a flow's idle timer fires, OVS sends a FlowRemoved event with byte count, packet
+count, and duration. The controller decrements \texttt{active\_conns}, updates
+counters, updates the EWMA of flow duration, and writes a \texttt{flow\_removed}
+record to the JSONL log. Figure~\ref{fig:flow} shows the full request lifecycle.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  step/.style={draw, rounded corners=3pt, minimum width=3.8cm,
+               minimum height=0.58cm, font=\scriptsize, align=center, fill=blue!8},
+  arr/.style={-Stealth, thick},
+  node distance=0.38cm
+]
+  \node[step](syn) {Client SYN $\to$ VIP:8000};
+  \node[step,below=of syn](pi)  {PacketIn $\to$ Ryu};
+  \node[step,below=of pi] (sel) {Algorithm selects backend};
+  \node[step,below=of sel](fm)  {FlowMod pair installed};
+  \node[step,below=of fm] (fwd) {Packet forwarded to backend};
+  \node[step,below=of fwd](rep) {Response; OVS rewrites src $\to$ VIP};
+  \node[step,below=of rep](exp) {Flow idles \SI{2}{s} $\to$ FlowRemoved};
+  \node[step,below=of exp](upd) {active\_conns$--$; metrics updated};
+  \foreach \a/\b in {syn/pi,pi/sel,sel/fm,fm/fwd,fwd/rep,rep/exp,exp/upd}
+    \draw[arr](\a)--(\b);
+\end{tikzpicture}
+\caption{Lifecycle of one HTTP request.}
+\label{fig:flow}
+\end{figure}
+
+\subsection{Load-Balancing Algorithms}
+
+Both algorithms subclass \texttt{LoadBalancingAlgorithm} and are registered in a
+central registry, selectable via the \texttt{LB\_ALGORITHM} environment variable
+(Strategy pattern).
+
+\subsubsection{Weighted Round Robin}
+A cursor advances through the server list one step per request. For weight $w > 1$,
+a server is picked $w$ consecutive times before the cursor moves. The algorithm never
+reads any metric --- it is fully oblivious to current load. Predictable and simple, but
+cannot adapt.
+
+\subsubsection{Least Connections}
+At each selection, a weighted load is computed for every backend:
+\begin{equation}
+  \ell_i = \frac{\text{active\_conns}_i}{\max(w_i,\,\varepsilon)}, \quad \varepsilon = 0.01
+  \label{eq:lc}
+\end{equation}
+The server with minimum $\ell_i$ is chosen; ties broken uniformly at random.
+Under sequential traffic all servers reach $\ell_i = 0$ at each arrival, so LC
+reduces to random selection. Its advantage is only realised under concurrent load,
+where slow servers accumulate connections and LC routes around them while RR keeps
+sending on schedule.
+
+\subsection{Metrics Collection}
+
+Each backend has a \texttt{ServerMetrics} object (Table~\ref{tab:metrics}). EWMA
+smoothing ($\alpha = 0.3$) is applied to throughput, connection rate, and flow
+duration.
+
+\begin{table}[t]
+\centering
+\caption{Per-server metrics tracked by the controller.}
+\label{tab:metrics}
+\begin{tabular}{lll}
+\toprule
+\textbf{Metric} & \textbf{Unit} & \textbf{Source} \\
+\midrule
+active\_conns     & conns  & FlowRemoved \\
+total\_bytes      & bytes  & FlowRemoved \\
+total\_packets    & pkts   & FlowRemoved \\
+throughput\_bps   & bit/s  & PortStats (EWMA) \\
+conn\_rate\_eps   & conn/s & select() (EWMA) \\
+avg\_flow\_dur\_s & s      & FlowRemoved (EWMA) \\
+port\_errors      & count  & PortStats \\
+selections\_total & count  & select() \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All metrics feed into a composite score for a future adaptive algorithm:
+\begin{equation}
+  s_i = \frac{c_i}{w_i} + 0.5\frac{q_i}{w_i}
+      + 0.3\frac{\text{bps}_i}{10^7 w_i}
+      + 0.2\frac{r_i}{w_i}
+      + 2.0\,e_i + 0.2\,d_i + 0.01\frac{n_i}{w_i}
+  \label{eq:score}
+\end{equation}
+Lower score = more desirable backend. The score is logged at every snapshot but not
+yet used by any live algorithm.
+
+Metrics are written to a JSONL file with events \texttt{select},
+\texttt{flow\_removed}, and \texttt{snapshot}. A separate CSV records server,
+status, and elapsed time per request.
+
+\paragraph{Future improvements.}
+A REST/Prometheus endpoint would allow external monitoring. The score weights are
+currently hardcoded and could be tuned. An adaptive scheduler using
+Eq.~\eqref{eq:score} in real time is a planned extension.
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Software Stack}
+
+\begin{table}[t]
+\centering
+\caption{Software versions used in all experiments.}
+\label{tab:stack}
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Version} \\
+\midrule
+OS           & Linux (Ubuntu-based) \\
+Python       & 3.7.17 (isolated venv) \\
+Ryu          & 4.34 \\
+Mininet      & 2.3.x \\
+Open vSwitch & system-installed \\
+OpenFlow     & 1.3 \citep{of13spec} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Server Profiles}
+
+Each backend runs a minimal Python HTTP server with simulated processing delay
+encoding the kind of heterogeneity present in real deployments (Table~\ref{tab:profiles}).
+
+\begin{table}[t]
+\centering
+\caption{Application-level processing profiles. Spike events add 50--250\,ms extra.}
+\label{tab:profiles}
+\begin{tabular}{lcccc}
+\toprule
+& \textbf{Base} & \textbf{Jitter} & \textbf{Spike} & \textbf{Error} \\
+\midrule
+h2 (fast)   & \SI{5}{ms}  & $\pm$\SI{3}{ms}  & 5\%  & 3\% \\
+h3 (medium) & \SI{20}{ms} & $\pm$\SI{10}{ms} & 10\% & 5\% \\
+h4 (slow)   & \SI{40}{ms} & $\pm$\SI{20}{ms} & 15\% & 4\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Combined with the link delays, the expected round-trip ranges are:
+h2~$\approx$~35--45\,ms, h3~$\approx$~60--320\,ms, h4~$\approx$~90--340\,ms
+(upper end during spikes). The 500 errors verify that the pipeline classifies them
+separately from successful responses.
+
+\subsection{Traffic Generator}
+
+Requests are sent sequentially from \texttt{h1} via \texttt{curl} with a 0.5\,s
+inter-request gap. Each request is timed and its response body is parsed to identify
+the serving backend. Three warm-up requests (discarded) populate ARP tables before
+the measured phase. The controller readiness check verifies that port 6633 is bound
+via \texttt{ss} --- no packets go through the switch, so the algorithm cursor is not
+advanced before the first real request. A 5\,s drain period after the last request
+allows all flows to expire cleanly.
+
+\subsection{Automated Experiment Runner}
+
+\texttt{scripts/run\_experiment.sh} orchestrates everything:
+\begin{enumerate}
+\item Clears \texttt{results/}.
+\item Prompts for algorithm choice (RR, LC, or both).
+\item For each algorithm: cleanup, start Ryu, wait for port 6633, run traffic, drain, stop Ryu.
+\item Generate per-algorithm plots (\texttt{plot\_metrics.py}).
+\item If both ran, generate comparison plots (\texttt{plot\_comparison.py}).
+\end{enumerate}
+A full two-algorithm run launches with a single
+\texttt{sudo bash scripts/run\_experiment.sh}.
+
+\paragraph{Future improvements.}
+The most critical next step is concurrent traffic: multiple parallel \texttt{curl}
+processes firing simultaneously. This is where LC is expected to clearly outperform RR.
+Adding unequal server weights is another planned extension.
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Results}
+\label{sec:results}
+
+\subsection{Traffic Distribution}
+
+Figure~\ref{fig:dist_rr} shows request counts per backend for a 50-request Round
+Robin run. With equal weights and sequential arrivals the expected distribution is
+one-third each, which the result closely matches.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{01_request_distribution.png}
+\caption{Request distribution for Round Robin (50 requests).}
+\label{fig:dist_rr}
+\end{figure}
+
+\subsection{Response Times}
+
+Figure~\ref{fig:lat_rr} shows per-request latencies. Three distinct bands are visible,
+confirming that the server and link profiles produce the intended differentiation between
+backends.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{02_response_times.png}
+\caption{Per-request response times for Round Robin. Each backend forms a distinct
+  latency band.}
+\label{fig:lat_rr}
+\end{figure}
+
+\subsection{Active Connections Over Time}
+
+Figure~\ref{fig:ac_rr} shows active connection counts from the event stream. Under
+sequential traffic the signal oscillates 0~$\to$~1; the cyclic pattern identifies which
+server is holding the current connection.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{03_active_conns.png}
+\caption{Active connections per backend over time (Round Robin).}
+\label{fig:ac_rr}
+\end{figure}
+
+\subsection{Cumulative Selections}
+
+For equal-weight RR the three selection curves grow in parallel
+(Figure~\ref{fig:cum_rr}), confirming the strict cyclic order.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{04_cumulative_selections.png}
+\caption{Cumulative backend selections over time (Round Robin). Equal weights produce
+  three parallel lines.}
+\label{fig:cum_rr}
+\end{figure}
+
+\subsection{Bytes Transferred}
+
+Figure~\ref{fig:bytes_rr} shows cumulative bytes per backend. Equal-size responses
+produce parallel growth lines; deviations would indicate unequal distribution.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{06_total_bytes.png}
+\caption{Cumulative bytes per backend (Round Robin).}
+\label{fig:bytes_rr}
+\end{figure}
+
+\subsection{Algorithm Comparison}
+
+Figures~\ref{fig:cmp_lat}--\ref{fig:cmp_err} compare RR and LC. Under sequential
+load the distributions are similar --- as expected, since LC reduces to random
+selection when all $\ell_i = 0$. The figures provide a correct baseline and confirm
+that both algorithms work. The meaningful comparison requires concurrent-load
+experiments (future work).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{cmp_01_latency_distribution.png}
+\caption{Latency distributions per backend: Round Robin vs.\ Least Connections.}
+\label{fig:cmp_lat}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{cmp_02_mean_latency.png}
+\caption{Mean response latency per backend for both algorithms.}
+\label{fig:cmp_mean}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{cmp_03_request_distribution.png}
+\caption{Total requests per backend under RR and LC.}
+\label{fig:cmp_dist}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{cmp_05_latency_over_time.png}
+\caption{Latency over time, coloured by backend.}
+\label{fig:cmp_time}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{cmp_06_error_rate.png}
+\caption{500 errors per backend for both algorithms.}
+\label{fig:cmp_err}
+\end{figure}
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+
+\textit{This section will be completed once the full comparative experiment,
+including concurrent-load trials, is finished.}
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Conclusion}
+\label{sec:conclusion}
+
+\textit{This section will be completed once the experimental results and discussion
+are finalised.}
+
+% ══════════════════════════════════════════════════════════════════════
+\bibliography{refs}
+
+\end{document}

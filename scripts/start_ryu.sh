@@ -1,3 +1,6 @@
-cd ~/Desktop/teza
+set -e
+cd "$(dirname "$0")/.."
 source .venv/bin/activate
-ryu-manager controller.rrlb
+
+# Phase 2: adaptive load balancer with metrics
+exec ryu-manager --observe-links controller/load_balancer.py

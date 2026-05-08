@@ -1,9 +1,0 @@
-algorithm,scope,name,requests,completed,failed,avg_response_ms,avg_wait_ms,busy_ms,idle_ms,utilization,makespan_ms
-Round Robin,global,all_servers,60,59,1,18143.49,10785.78,434105,437143,49.83,124464
-Round Robin,server,serv1,9,9,0,13317.56,6539.78,61000,63464,49.01,124464
-Round Robin,server,serv2,8,8,0,9005.0,4094.25,39286,85178,31.56,124464
-Round Robin,server,serv3,8,8,0,20652.5,13256.62,59167,65297,47.54,124464
-Round Robin,server,serv4,9,9,0,33736.56,20125.44,122500,1964,98.42,124464
-Round Robin,server,serv5,9,9,0,10063.78,5681.11,39444,85020,31.69,124464
-Round Robin,server,serv6,8,8,0,35115.62,24699.0,83333,41131,66.95,124464
-Round Robin,server,serv7,8,8,0,4777.5,1105.62,29375,95089,23.6,124464
