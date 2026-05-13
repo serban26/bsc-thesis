@@ -119,7 +119,7 @@
 \begin{titlepage}
 \begin{figure}[h]
 \centering
-\includegraphics[width=\textwidth]{figures/banner.png}
+\includegraphics[width=\textwidth]{banner.png}
 \end{figure}
 \bigskip
 \bigskip
@@ -419,15 +419,17 @@ requests currently waiting (plus the incoming one) multiplied by the expected
 service time per request. The denominator is a dynamic weight that adjusts
 continuously using a second EWMA layer:
 \begin{equation}
-  \text{dyn\_weight}_{i}^{(t+1)} =
-    (1 - \alpha_d)\,\text{dyn\_weight}_{i}^{(t)}
-    + \alpha_d \cdot w_i^{\text{static}}
+\begin{split}
+  \text{dyn\_weight}_{i}^{(t+1)} &=
+    (1 - \alpha_d)\,\text{dyn\_weight}_{i}^{(t)}\\
+    &\quad + \alpha_d \cdot w_i^{\text{static}}
       \cdot \frac{\bar{\mu}}{\mu_i}
+\end{split}
   \label{eq:dba}
 \end{equation}
 where $\bar{\mu}$ is the global mean flow duration, $\mu_i$ is the per-server
 mean, and $\alpha_d = 0.25$ is the adaptation rate. When server $i$ is slower
-than average, $\dyn\_weight$ decreases, which increases $\ell_i$ and reduces
+than average, $\text{dyn\_weight}_i$ decreases, which increases $\ell_i$ and reduces
 the traffic sent to it. When it recovers, the weight rises again.
 
 The key advantage over LRT is the $(\text{active\_conns} + 1)$ term. When a
@@ -493,20 +495,19 @@ The 50 backends are split into four tiers based on their index, designed to
 mimic a realistic heterogeneous deployment (Table~\ref{tab:tiers}).
 
 \begin{table}[t]
-\centering
-\caption{Server tier definitions. Processing delay is applied inside the HTTP
-  handler; semaphore limits concurrency. Spikes multiply the base delay
-  periodically and are staggered across servers.}
+\centering\footnotesize
+\caption{Server tier definitions. Delay per request; semaphore limits
+  concurrency; spikes staggered across servers.}
 \label{tab:tiers}
-\begin{tabular}{lccccc}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccc}
 \toprule
-\textbf{Tier} & \textbf{Count} & \textbf{Base delay} & \textbf{Max conc.}
-  & \textbf{Spike $\times$} & \textbf{Period} \\
+\textbf{Tier} & \textbf{Delay} & \textbf{Conc.} & \textbf{Spike} \\
 \midrule
-A (fast)      & 20 & 5--25\,ms   & 8--16 & 8$\times$ & 20\,s \\
-B (medium)    & 10 & 50--150\,ms & 4--8  & 5$\times$ & 25\,s \\
-C (slow)      & 10 & 300--600\,ms& 2--3  & 2$\times$ & 30\,s \\
-D (very slow) & 10 & 800--1000\,ms& 1    & 1.5$\times$& 40\,s \\
+A (fast)      & 5--25\,ms     & 8--16 & 8$\times$ \\
+B (medium)    & 50--150\,ms   & 4--8  & 5$\times$ \\
+C (slow)      & 300--600\,ms  & 2--3  & 2$\times$ \\
+D (very slow) & 800--1000\,ms & 1     & 1.5$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -571,42 +572,41 @@ sends requests to the slow Tier~D servers, which dominate the variance.
 \label{fig:cmp_lat_dist}
 \end{figure*}
 
-\subsection{Tail Latency}
+\subsection{Load-Balancing Fairness}
 
-Figure~\ref{fig:cmp_percentiles} shows the p50, p95, and p99 latency for each
-algorithm. The tail is where the difference is most pronounced: AP's p95 is
-241\,ms compared to 502\,ms for LRT and 1144\,ms for RR. This is a direct
-consequence of AP routing away from spiking servers faster --- the active
-connection count rises immediately when a server is overloaded, before the EWMA
-has time to update.
+Figure~\ref{fig:cmp_percentiles} shows the coefficient of variation (CV) of
+request counts across the 50 backends. A CV of zero means every server received
+exactly the same number of requests; higher values indicate more skewed
+distribution. RR scores near zero by construction — it cycles uniformly.
+AP and LRT deliberately concentrate traffic on fast servers, so their CV is
+higher, but this is expected and desirable: they are routing \emph{intelligently}
+rather than blindly. The fairness metric alone is therefore not a quality
+criterion; it must be read alongside latency.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\columnwidth]{figures/comparison/cmp_04_latency_percentiles.png}
-\caption{Latency percentiles (p50 / p95 / p99) per algorithm. AP's p95 and p99
-  are substantially lower than all other algorithms.}
+\includegraphics[width=\columnwidth]{figures/comparison/cmp_04_fairness.png}
+\caption{Load-balancing fairness across 50 backends, measured as the
+  coefficient of variation (CV) of request counts per server.
+  Lower CV means more even distribution; RR is perfectly even by design.}
 \label{fig:cmp_percentiles}
 \end{figure}
 
-\subsection{Tier Routing Distribution}
+\subsection{Server Utilisation}
 
-Figure~\ref{fig:cmp_tier} shows the fraction of requests each algorithm sent
-to each server tier. RR distributes evenly by design: roughly 40\% to Tier~A,
-20\% to each of B, C, and D. WRR shifts more traffic to Tier~A through its
-weight assignments but still sends a fixed fraction to slower tiers regardless
-of current conditions.
-
-AP sends approximately 87\% of traffic to Tier~A and only 1\% to Tier~D,
-compared to RR's 40\% and 20\% respectively. This matches the expected behaviour
-of the work-left score: once a Tier~D server has been visited once or twice,
-its $\text{avg\_flow\_dur\_s}$ is large enough that the score always points to
-something better.
+Figure~\ref{fig:cmp_tier} shows mean server utilisation efficiency, defined as
+the fraction of the experiment duration during which each backend was actively
+processing a request, averaged across all backends. AP and LRT achieve the
+highest utilisation on fast Tier~A servers and leave slow Tier~D servers mostly
+idle, which is the correct outcome. RR's uniform routing keeps all servers
+equally busy regardless of speed, inflating the average latency.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\columnwidth]{figures/comparison/cmp_06_tier_routing.png}
-\caption{Fraction of successful requests routed to each tier. AP concentrates
-  traffic on fast Tier~A servers; RR distributes evenly regardless of speed.}
+\includegraphics[width=\columnwidth]{figures/comparison/cmp_06_utilization.png}
+\caption{Mean server utilisation efficiency (busy time / experiment duration,
+  averaged across backends). Higher is better; AP and LRT keep fast servers
+  busier while leaving slow servers largely idle.}
 \label{fig:cmp_tier}
 \end{figure}
 
@@ -627,6 +627,7 @@ to react.
 \label{fig:cmp_time}
 \end{figure}
 
+\newpage
 \subsection{Composite Score}
 
 To summarise algorithm quality in a single number, a composite score is defined:
