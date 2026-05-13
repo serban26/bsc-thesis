@@ -31,45 +31,63 @@ echo -e "    1) round_robin           — simple cycle, equal distribution"
 echo -e "    2) weighted_round_robin  — cycle weighted by server capacity"
 echo -e "    3) least_connections     — always pick least-loaded backend"
 echo -e "    4) least_response_time   — always pick fastest-responding backend"
-echo -e "    5) all four              — run each in sequence, then compare"
+    echo -e "    5) adaptive_predictive   — least work left + dynamic bandwidth allocation"
+    echo -e "    6) all five              — run each in sequence, then compare"
 echo ""
-read -rp "$(echo -e "  ${CYAN}?${RESET} Choose [1/2/3/4/5]: ")" _algo_choice
+read -rp "$(echo -e "  ${CYAN}?${RESET} Choose [1/2/3/4/5/6]: ")" _algo_choice
 case "$_algo_choice" in
     2) ALGOS=("weighted_round_robin") ;;
     3) ALGOS=("least_connections") ;;
     4) ALGOS=("least_response_time") ;;
-    5) ALGOS=("round_robin" "weighted_round_robin" "least_connections" "least_response_time") ;;
+    5) ALGOS=("adaptive_predictive") ;;
+    6) ALGOS=("round_robin" "weighted_round_robin" "least_connections" "least_response_time" "adaptive_predictive") ;;
     *) ALGOS=("round_robin") ;;
 esac
 
 echo ""
 echo -e "  ${BOLD}Traffic parameters${RESET}"
-NUM_REQUESTS=$(ask "Number of HTTP requests per run" "30")
-REQUEST_DELAY=$(ask "Delay between requests (seconds)" "0.5")
+NUM_REQUESTS=$(ask "Number of HTTP requests per run" "1500")
+RATE=$(ask "Request rate (req/s sent from client)" "40")
 
 echo ""
-echo -e "  ${BOLD}Backend servers${RESET}"
-NUM_SERVERS=$(ask "Number of backend servers (h2..hN)" "3")
+echo -e "  ${BOLD}Backend servers${RESET}  ${DIM}(ordered best-first: h2=fastest Tier A, hN=slowest Tier D)${RESET}"
+NUM_SERVERS=$(ask "Number of backend servers (h2..hN)" "50")
 
 echo ""
-echo -e "  ${BOLD}Backend weights${RESET}  ${DIM}(max weight for h2; each subsequent server decreases by 1, floor 1)${RESET}"
-MAX_WEIGHT=$(ask "Max weight for h2" "3")
+echo -e "  ${BOLD}Backend weights${RESET}  ${DIM}(Tier A weight; B gets /4, C gets /8, D gets 1 -- mirrors server capacity)${RESET}"
+MAX_WEIGHT=$(ask "Max weight (Tier A)" "16")
 
-# Auto-generate descending weights: MAX_WEIGHT, MAX_WEIGHT-1, ..., floor at 1
-WEIGHTS=""
-for ((i=0; i<NUM_SERVERS; i++)); do
-    w=$((MAX_WEIGHT - i))
-    [[ $w -lt 1 ]] && w=1
-    WEIGHTS="${WEIGHTS:+$WEIGHTS,}$w"
-done
+# Tier-based weight generation: mirrors the 4-tier server pool in run_net_auto.py.
+#   Tier A (fast,   first 40%): MAX_WEIGHT        -- powerful machines
+#   Tier B (medium, next  30%): MAX_WEIGHT // 4   -- standard servers
+#   Tier C (slow,   next  20%): MAX_WEIGHT // 8   -- underpowered
+#   Tier D (legacy, last  10%): 1                 -- old hardware
+#
+# A linear "-1 per step" formula collapses to the same weight for all servers
+# when N >> MAX_WEIGHT, making WRR indistinguishable from RR in the plots.
+# Tier-based weights give WRR the same routing intent as LC/LRT/AP -- the
+# fair static baseline for comparison against the dynamic algorithms.
+WEIGHTS=$(python3 - <<PYEOF
+n, max_w = $NUM_SERVERS, $MAX_WEIGHT
+thresholds = (0.40, 0.70, 0.90)
+weights = []
+for i in range(n):
+    frac = i / max(n - 1, 1)
+    if   frac < thresholds[0]: w = max_w
+    elif frac < thresholds[1]: w = max(1, max_w // 4)
+    elif frac < thresholds[2]: w = max(1, max_w // 8)
+    else:                      w = 1
+    weights.append(w)
+print(','.join(str(w) for w in weights))
+PYEOF
+)
 
-DRAIN_SECS=5
+DRAIN_SECS=15
 
 echo ""
 echo -e "  ${GREEN}▶  algorithm(s) :${RESET} ${ALGOS[*]}"
 echo -e "  ${GREEN}▶  servers      :${RESET} $NUM_SERVERS  (h2 … h$((NUM_SERVERS + 1)))"
-echo -e "  ${GREEN}▶  requests     :${RESET} $NUM_REQUESTS"
-echo -e "  ${GREEN}▶  delay        :${RESET} ${REQUEST_DELAY}s between requests"
+echo -e "  ${GREEN}▶  requests     :${RESET} $NUM_REQUESTS  at ${RATE} req/s"
 echo -e "  ${GREEN}▶  weights      :${RESET} $WEIGHTS"
 echo ""
 read -rp "$(echo -e "  ${CYAN}?${RESET} Press Enter to start (Ctrl-C to cancel) ")" _
@@ -130,7 +148,7 @@ for ALGO in "${ALGOS[@]}"; do
     echo ""
     LB_REQUESTS="$NUM_REQUESTS" \
     LB_DRAIN="$DRAIN_SECS" \
-    LB_DELAY="$REQUEST_DELAY" \
+    LB_RATE="$RATE" \
     LB_REQUESTS_CSV="$REQUESTS_CSV" \
     LB_NUM_SERVERS="$NUM_SERVERS" \
         sudo -E python3 topo/run_net_auto.py

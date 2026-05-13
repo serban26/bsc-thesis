@@ -20,7 +20,9 @@ Environment:
 """
 
 import csv
+import json
 import os
+import random
 import signal
 import sys
 import time
@@ -41,13 +43,65 @@ HTTP_PORT  = 8000
 # ── experiment parameters ──────────────────────────────────────────────────
 NUM_REQUESTS  = int(os.environ.get("LB_REQUESTS", sys.argv[1] if len(sys.argv) > 1 else "30"))
 DRAIN_SECS    = int(os.environ.get("LB_DRAIN",    sys.argv[2] if len(sys.argv) > 2 else "5"))
-REQUEST_DELAY = float(os.environ.get("LB_DELAY", "0.5"))   # seconds between GETs
 REQUESTS_CSV  = os.environ.get("LB_REQUESTS_CSV", "/tmp/lb_requests.csv")
 NUM_SERVERS   = int(os.environ.get("LB_NUM_SERVERS", "3"))
+# Rate at which the client fires requests (requests/second).
+#
+# With 50 servers at RATE=40: each server receives 0.8 req/s from RR.
+# Tier D (last 10%, 800-1000 ms service, max_concurrent=1):
+#   capacity ≈ 1.0-1.25 req/s  →  ρ ≈ 0.65-0.80
+#   M/M/1 mean wait = ρ/(1-ρ) × E[S] ≈ 1.5-3.2 s  →  total ≈ 2-4 s per req
+# AP avoids Tier D after warm-up  →  mean ≈ 30-60 ms (Tier A+B only)
+# → RR mean ~400 ms  vs  AP mean ~40 ms  — 10× difference in every plot
+RATE = float(os.environ.get("LB_RATE", "40.0"))
 
 import shutil
 
 _SCRIPT_DIR = "/tmp/lb_servers"
+
+# ─── heterogeneous server pool ─────────────────────────────────────────────
+#
+# Servers are ordered best-first (h2 = fastest, hN = slowest) so that WRR
+# weights (higher index → lower weight) naturally align with capacity, and
+# smart algorithms (LC, LRT, AP) converge on the fast tier quickly.
+#
+# Four performance tiers based on fractional position in the pool:
+#   A (fast,   first 40%): powerful machines, low latency, high concurrency
+#   B (medium, next  30%): standard rack servers
+#   C (slow,   next  20%): underpowered / CPU-saturated machines
+#   D (legacy, last  10%): old hardware, strictly single-threaded
+#
+# At RATE=40 with 50 servers (RR sends 0.8 req/s per server):
+#   Tier D capacity ≈ 1.0-1.25 req/s  →  ρ ≈ 0.65-0.80
+#   M/M/1 mean wait = ρ/(1-ρ) × E[S] ≈ 1.5-3 s  →  total ≈ 2-4 s per request
+#   AP avoids Tier D after warm-up → mean ≈ 30-60 ms (Tier A+B only)
+#   Result: RR mean ~400 ms  vs  AP mean ~40 ms  — 10× visible in every plot
+_TIER_THRESHOLDS = (0.40, 0.70, 0.90)   # A<40% ≤ B<70% ≤ C<90% ≤ D
+
+_TIER_PARAMS = {
+    #       base latency (ms)        jitter (ms)          spike   error  concurrency
+    'A': dict(base_lo=5,    base_hi=25,  jit_lo=2,  jit_hi=8,   spike=0.02, err=0.005, conc_lo=8,  conc_hi=16),
+    'B': dict(base_lo=50,   base_hi=150, jit_lo=15, jit_hi=50,  spike=0.05, err=0.010, conc_lo=4,  conc_hi=8),
+    'C': dict(base_lo=300,  base_hi=600, jit_lo=40, jit_hi=80,  spike=0.08, err=0.015, conc_lo=2,  conc_hi=3),
+    'D': dict(base_lo=800,  base_hi=1000,jit_lo=60, jit_hi=120, spike=0.10, err=0.020, conc_lo=1,  conc_hi=1),
+}
+
+# Network link delays per tier (fast servers = good network placement)
+_TIER_LINK = {
+    'A': dict(delay="2ms",  jitter="1ms"),
+    'B': dict(delay="5ms",  jitter="2ms"),
+    'C': dict(delay="10ms", jitter="4ms"),
+    'D': dict(delay="18ms", jitter="6ms"),
+}
+
+
+def _assign_tier(idx: int, n: int) -> str:
+    """Return tier letter (A/B/C/D) for the idx-th server (0-based) in a pool of n."""
+    frac = idx / max(n - 1, 1)
+    if frac < _TIER_THRESHOLDS[0]: return 'A'
+    if frac < _TIER_THRESHOLDS[1]: return 'B'
+    if frac < _TIER_THRESHOLDS[2]: return 'C'
+    return 'D'
 
 
 def build():
@@ -60,23 +114,12 @@ def build():
     # client link: low base delay, small jitter
     net.addLink(h1, s1, delay="2ms", jitter="1ms")
     servers = []
-    # base link profiles for the first 3 servers; extras get increasing latency
-    _base_profiles = [
-        dict(delay="3ms",  jitter="1ms"),   # h2 — fast
-        dict(delay="8ms",  jitter="3ms"),   # h3 — medium
-        dict(delay="15ms", jitter="5ms"),   # h4 — slow
-    ]
     for idx in range(NUM_SERVERS):
-        i = idx + 2  # host number: 2, 3, 4, ...
-        if idx < len(_base_profiles):
-            profile = _base_profiles[idx]
-        else:
-            # Spread extra servers between 20ms and 40ms — meaningful but not absurd
-            ms = 20 + min(20, 4 * (idx - 3))
-            profile = dict(delay=f"{ms}ms", jitter="5ms")
-        h = net.addHost(f"h{i}", ip=f"10.0.0.{i}/24",
-                        mac=f"00:00:00:00:00:{i:02x}")
-        net.addLink(h, s1, **profile)
+        i    = idx + 2
+        tier = _assign_tier(idx, NUM_SERVERS)
+        h    = net.addHost(f"h{i}", ip=f"10.0.0.{i}/24",
+                           mac=f"00:00:00:00:00:{i:02x}")
+        net.addLink(h, s1, **_TIER_LINK[tier])
         servers.append(h)
     return net, h1, servers
 
@@ -86,27 +129,26 @@ def _prepare_script_dir():
     os.makedirs(_SCRIPT_DIR, mode=0o755, exist_ok=True)
 
 
-# Per-server processing-time profiles (base_ms, jitter_ms, spike_prob, error_prob)
-# h2 = fast and reliable, h3 = medium with occasional spikes, h4 = slower/variable
-# Extra servers (h5+) get progressively slower profiles.
-_SERVER_PROFILES = {
-    "h2": dict(base_ms=5,  jitter_ms=3,  spike_prob=0.05, error_prob=0.03),
-    "h3": dict(base_ms=20, jitter_ms=10, spike_prob=0.10, error_prob=0.05),
-    "h4": dict(base_ms=40, jitter_ms=20, spike_prob=0.15, error_prob=0.04),
-}
-# Auto-fill profiles for h5, h6, ... up to NUM_SERVERS servers
-for _idx in range(3, NUM_SERVERS):
+# ─── per-server processing-time profiles ───────────────────────────────────
+# Generated from _TIER_PARAMS using a per-server deterministic RNG so every
+# algorithm run sees identical server behaviour (fair comparison).
+# max_concurrent = semaphore inside the server: controls real parallelism.
+# Tier D (max_concurrent=1) strictly queues incoming requests, creating
+# measurable back-pressure that LC/LRT/AP learn to avoid.
+_SERVER_PROFILES = {}
+for _idx in range(NUM_SERVERS):
     _hname = f"h{_idx + 2}"
-    if _hname not in _SERVER_PROFILES:
-        # Spread extra servers between h4 (40ms) and ~80ms, then plateau
-        _base = min(80, 40 + 5 * (_idx - 2))
-        _jitter = min(25, 20 + 2 * (_idx - 2))
-        _SERVER_PROFILES[_hname] = dict(
-            base_ms=_base,
-            jitter_ms=_jitter,
-            spike_prob=min(0.20, 0.15 + 0.01 * (_idx - 2)),
-            error_prob=0.05,
-        )
+    _tier  = _assign_tier(_idx, NUM_SERVERS)
+    _p     = _TIER_PARAMS[_tier]
+    # Large prime multiplier spreads seeds far apart to avoid correlation
+    _rng   = random.Random(_idx * 0x9E3779B9 & 0xFFFFFFFF)
+    _SERVER_PROFILES[_hname] = dict(
+        base_ms        = int(_rng.uniform(_p['base_lo'],  _p['base_hi'])),
+        jitter_ms      = int(_rng.uniform(_p['jit_lo'],   _p['jit_hi'])),
+        spike_prob     = _p['spike'],
+        error_prob     = _p['err'],
+        max_concurrent = _rng.randint(_p['conc_lo'], _p['conc_hi']),
+    )
 
 
 def _write_server_script(host_name: str, host_ip: str) -> str:
@@ -121,45 +163,59 @@ def _write_server_script(host_name: str, host_ip: str) -> str:
     seed_val = sum(ord(c) * (i + 1) for i, c in enumerate(host_name))
     script = f"""\
 #!/usr/bin/env python3
-import http.server, socketserver, time, random
+import http.server, socketserver, time, random, threading
 
-# Fixed seed — same for every algorithm run that uses this server,
-# so delay/error sequences are reproducible and comparable.
+# Fixed seed — reproducible delay/error sequence across algorithm runs.
 random.seed({seed_val})
 
-BODY       = b"{body}\\n"
-PORT       = {HTTP_PORT}
-BASE_MS    = {p['base_ms']}
-JITTER_MS  = {p['jitter_ms']}
-SPIKE_PROB = {p['spike_prob']}   # probability of a latency spike this request
-ERROR_PROB = {p['error_prob']}   # probability of a 500 response
+BODY          = b"{body}\\n"
+PORT          = {HTTP_PORT}
+BASE_MS       = {p['base_ms']}
+JITTER_MS     = {p['jitter_ms']}
+SPIKE_PROB    = {p['spike_prob']}
+ERROR_PROB    = {p['error_prob']}
+MAX_CONC      = {p.get('max_concurrent', 2)}
+
+# Semaphore: only MAX_CONC requests process simultaneously.
+# Any extra connections are accepted by the OS (TCP backlog) and
+# physically wait here until a slot is free.  This creates a real,
+# measurable queue that active_conns in the controller reflects.
+_sem = threading.Semaphore(MAX_CONC)
 
 class _H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        # simulate server processing time
-        delay_s = (BASE_MS + random.uniform(-JITTER_MS, JITTER_MS)) / 1000.0
-        delay_s = max(delay_s, 0.001)
-        # occasional spike (e.g. GC pause, cache miss)
-        if random.random() < SPIKE_PROB:
-            delay_s += random.uniform(0.05, 0.25)
-        time.sleep(delay_s)
-        # occasional server error
-        if random.random() < ERROR_PROB:
-            self.send_response(500)
+        _sem.acquire()
+        try:
+            delay_s = (BASE_MS + random.uniform(-JITTER_MS, JITTER_MS)) / 1000.0
+            delay_s = max(delay_s, 0.001)
+            if random.random() < SPIKE_PROB:
+                delay_s += random.uniform(0.05, 0.30)
+            time.sleep(delay_s)
+            if random.random() < ERROR_PROB:
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "6")
+                self.end_headers()
+                self.wfile.write(b"error\\n")
+                return
+            self.send_response(200)
             self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", "6")
+            self.send_header("Content-Length", str(len(BODY)))
             self.end_headers()
-            self.wfile.write(b"error\\n")
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(BODY)))
-        self.end_headers()
-        self.wfile.write(BODY)
+            self.wfile.write(BODY)
+        finally:
+            _sem.release()
     def log_message(self, fmt, *args): pass
 
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("0.0.0.0", PORT), _H) as srv:
+# ThreadingTCPServer: each incoming TCP connection gets its own thread.
+# Combined with the semaphore above this gives us:
+#   • real concurrent connection acceptance (no request dropped at TCP level)
+#   • configurable parallelism (MAX_CONC requests actually running at once)
+#   • measurable queue depth = accepted_threads - processing_threads
+class _S(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+with _S(("0.0.0.0", PORT), _H) as srv:
     srv.serve_forever()
 """
     with open(path, "w") as fh:
@@ -229,45 +285,126 @@ def wait_for_controller(client, retries=20, interval=1.0):
     return False
 
 
+_CLIENT_SCRIPT = "/tmp/lb_client.py"
+
+
+def _write_client_script(total: int, rate: float) -> None:
+    """Write a Python load-generator to /tmp/lb_client.py.
+
+    Uses urllib.request (pure Python, in-process) instead of subprocess curl.
+    This is critical: subprocess.run() inside threads spawned inside
+    Mininet's host.cmd() shell does NOT inherit the host's network namespace —
+    the forked curl processes run in the root namespace where the VIP doesn't
+    exist.  urllib.request uses the calling process's own socket, which IS
+    in the correct namespace.
+    """
+    delay = 1.0 / rate
+    script = f"""#!/usr/bin/env python3
+import threading, time, json
+import urllib.request, urllib.error
+
+TOTAL   = {total}
+DELAY   = {delay:.4f}   # 1 / rate  ({rate:.1f} req/s)
+URL     = "http://{VIP}:{HTTP_PORT}/"
+# 30 s timeout: Tier D servers (800-1000 ms, max_concurrent=1) under RR
+# accumulate queues → response times of 2-25 s depending on queue depth.
+# Keeping them as measured latency (not errors) makes the RR vs AP
+# difference visible in the latency and percentile plots, not error plots.
+TIMEOUT = 30.0
+
+results = [None] * TOTAL
+_lock   = threading.Lock()
+
+def fire(i):
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(URL, timeout=TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", errors="replace").strip()
+    except urllib.error.HTTPError as exc:
+        body = f"error: HTTP {{exc.code}}"
+    except Exception as exc:
+        body = f"error: {{exc}}"
+    elapsed = round(time.time() - t0, 4)
+    with _lock:
+        results[i] = {{"i": i + 1, "elapsed": elapsed, "body": body}}
+
+threads = []
+for i in range(TOTAL):
+    t = threading.Thread(target=fire, args=(i,), daemon=True)
+    t.start()
+    threads.append(t)
+    if i < TOTAL - 1:
+        time.sleep(DELAY)
+
+for t in threads:
+    t.join(timeout=TIMEOUT + 30.0)  # extra headroom for Tier D queue drain
+
+print(json.dumps(results))
+"""
+    with open(_CLIENT_SCRIPT, "w") as fh:
+        fh.write(script)
+
+
 def run_requests(client, n):
-    """Fire n sequential HTTP GETs from the client host. Returns list of dicts."""
+    """Fire n HTTP GETs at RATE req/s using a threaded Python client on h1.
+
+    Requests overlap: the client fires one every 1/RATE seconds regardless
+    of whether previous ones have finished.  This creates real concurrent
+    load that exposes the queue at slow servers.
+    """
     server_names = [f"h{2 + i}" for i in range(NUM_SERVERS)]
-    bar_map = {name: chr(0x2460 + i) for i, name in enumerate(server_names)}
-    bar_map["error"] = "✗"
-    bar_map["other"] = "?"
+
+    _write_client_script(n, RATE)
+    print(f"\nFiring {n} requests at {RATE:.1f} req/s to http://{VIP}:{HTTP_PORT}/")
+    print(f"  (inter-request delay: {1000/RATE:.0f}ms, {NUM_SERVERS} servers, "
+          f"Tier D capacity ~1.0-1.25 req/s)")
+    # For large runs print ~20 progress lines instead of one per request
+    _print_step = max(1, n // 20)
+
+    raw = client.cmd(f"python3 {_CLIENT_SCRIPT}")
+
+    # strip any stray mininet prompt / newlines that might prefix the JSON
+    raw = raw.strip()
+    json_start = raw.find('[')
+    if json_start > 0:
+        raw = raw[json_start:]
+
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"[ERROR] could not parse client output ({exc}): {raw[:300]}")
+        return []
 
     records = []
-    print(f"\nFiring {n} sequential HTTP GETs to http://{VIP}:{HTTP_PORT}/")
-    for i in range(1, n + 1):
-        t0 = time.time()
-        body = client.cmd(
-            f"curl -s --max-time 5 http://{VIP}:{HTTP_PORT}/"
-        ).strip()
-        elapsed = time.time() - t0
+    for item in sorted(data, key=lambda x: (x or {}).get("i", 0)):
+        if item is None:
+            continue
+        body    = item.get("body", "")
+        elapsed = item.get("elapsed", 0.0)
+        req_i   = item.get("i", 0)
 
-        srv = "other"
+        srv    = "other"
         status = "other"
         for name in server_names:
-            if f"served by {name} " in body:   # trailing space avoids h2 matching h20/h21
-                srv = name
+            if f"served by {name} " in body:
+                srv    = name
                 status = "ok"
                 break
-        if srv == "other" and "error" in body.lower():
-            srv = "error"
+        if srv == "other":
             status = "error"
+            srv    = "error"
 
         records.append({
-            "req": i,
-            "server": srv,
-            "status": status,
-            "elapsed_s": round(elapsed, 4),
-            "body": body[:80],
+            "req":       req_i,
+            "server":    srv,
+            "status":    status,
+            "elapsed_s": elapsed,
+            "body":      body[:80],
         })
-        bar = bar_map.get(srv, "?")
-        tag = f"  \033[31m[500]\033[0m" if status == "error" else ""
-        print(f"  [{i:3d}] {bar} {srv}  ({elapsed*1000:.0f} ms){tag}")
-        if REQUEST_DELAY > 0 and i < n:
-            time.sleep(REQUEST_DELAY)
+        tag = f"  \033[31m[err/timeout]\033[0m" if status == "error" else ""
+        if n <= 100 or req_i % _print_step == 0 or req_i == n or status == "error":
+            tier = _assign_tier(server_names.index(srv), NUM_SERVERS) if srv in server_names else "?"
+            print(f"  [{req_i:5d}/{n}] {srv:6s} tier={tier}  ({elapsed*1000:.0f} ms){tag}")
 
     return records
 
