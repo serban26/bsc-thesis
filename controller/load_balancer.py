@@ -75,11 +75,33 @@ CLIENT_PORT = 1            # h1's switch port
 CLIENT_IP = "10.0.0.1"
 CLIENT_MAC = "00:00:00:00:00:01"
 
-# (port, ip, mac, weight)
+# (name, switch_port, ip, mac, weight)
+# Weights are used by WeightedRoundRobin and LeastConnections/LRT normalisation.
+# Override via LB_WEIGHTS env var as comma-separated floats, e.g. "4,3,2,1"
+# Override server count via LB_NUM_SERVERS env var (default 3).
+_num_servers = int(os.environ.get("LB_NUM_SERVERS", "3"))
+_default_weights = [max(1.0, float(_num_servers) - i) for i in range(_num_servers)]
+_env_weights = os.environ.get("LB_WEIGHTS", "")
+if _env_weights:
+    try:
+        _parsed = [float(x) for x in _env_weights.split(",")]
+        # Pad with 1.0 or truncate to match _num_servers
+        if len(_parsed) >= _num_servers:
+            _default_weights = _parsed[:_num_servers]
+        else:
+            _default_weights = _parsed + [1.0] * (_num_servers - len(_parsed))
+    except ValueError:
+        pass
+
 BACKENDS = [
-    ("h2", 2, "10.0.0.2", "00:00:00:00:00:02", 1.0),
-    ("h3", 3, "10.0.0.3", "00:00:00:00:00:03", 1.0),
-    ("h4", 4, "10.0.0.4", "00:00:00:00:00:04", 1.0),
+    (
+        f"h{2 + i}",
+        2 + i,
+        f"10.0.0.{2 + i}",
+        f"00:00:00:00:00:{2 + i:02x}",
+        _default_weights[i],
+    )
+    for i in range(_num_servers)
 ]
 
 # Flow lifetimes

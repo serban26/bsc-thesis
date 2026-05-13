@@ -27,9 +27,18 @@ except ImportError:
     sys.exit(1)
 
 # ── colour palette (consistent across all plots) ─────────────────────────
-COLORS = {"h2": "#4C72B0", "h3": "#DD8452", "h4": "#55A868"}
-MARKERS = {"h2": "o", "h3": "s", "h4": "^"}
-SERVER_NAMES = ["h2", "h3", "h4"]
+_EXTRA_COLORS  = ["#C44E52", "#8172B3", "#937860", "#CCB974", "#64B5CD"]
+_EXTRA_MARKERS = ["D", "v", "P", "X", "*"]
+
+_num_servers = int(os.environ.get("LB_NUM_SERVERS", "3"))
+SERVER_NAMES = [f"h{2 + i}" for i in range(_num_servers)]
+
+_base_colors  = {"h2": "#4C72B0", "h3": "#DD8452", "h4": "#55A868"}
+_base_markers = {"h2": "o",       "h3": "s",       "h4": "^"}
+COLORS  = {name: _base_colors.get(name,  _EXTRA_COLORS[i % len(_EXTRA_COLORS)])
+           for i, name in enumerate(SERVER_NAMES)}
+MARKERS = {name: _base_markers.get(name, _EXTRA_MARKERS[i % len(_EXTRA_MARKERS)])
+           for i, name in enumerate(SERVER_NAMES)}
 
 
 # ─────────────────────────────────────────────────────────────────────────

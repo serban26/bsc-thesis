@@ -43,6 +43,7 @@ NUM_REQUESTS  = int(os.environ.get("LB_REQUESTS", sys.argv[1] if len(sys.argv) >
 DRAIN_SECS    = int(os.environ.get("LB_DRAIN",    sys.argv[2] if len(sys.argv) > 2 else "5"))
 REQUEST_DELAY = float(os.environ.get("LB_DELAY", "0.5"))   # seconds between GETs
 REQUESTS_CSV  = os.environ.get("LB_REQUESTS_CSV", "/tmp/lb_requests.csv")
+NUM_SERVERS   = int(os.environ.get("LB_NUM_SERVERS", "3"))
 
 import shutil
 
@@ -59,15 +60,22 @@ def build():
     # client link: low base delay, small jitter
     net.addLink(h1, s1, delay="2ms", jitter="1ms")
     servers = []
-    # each server gets a distinct link profile to make latency differences visible
-    link_profiles = [
+    # base link profiles for the first 3 servers; extras get increasing latency
+    _base_profiles = [
         dict(delay="3ms",  jitter="1ms"),   # h2 — fast
         dict(delay="8ms",  jitter="3ms"),   # h3 — medium
         dict(delay="15ms", jitter="5ms"),   # h4 — slow
     ]
-    for i, profile in zip((2, 3, 4), link_profiles):
+    for idx in range(NUM_SERVERS):
+        i = idx + 2  # host number: 2, 3, 4, ...
+        if idx < len(_base_profiles):
+            profile = _base_profiles[idx]
+        else:
+            # Spread extra servers between 20ms and 40ms — meaningful but not absurd
+            ms = 20 + min(20, 4 * (idx - 3))
+            profile = dict(delay=f"{ms}ms", jitter="5ms")
         h = net.addHost(f"h{i}", ip=f"10.0.0.{i}/24",
-                        mac=f"00:00:00:00:00:0{i}")
+                        mac=f"00:00:00:00:00:{i:02x}")
         net.addLink(h, s1, **profile)
         servers.append(h)
     return net, h1, servers
@@ -80,11 +88,25 @@ def _prepare_script_dir():
 
 # Per-server processing-time profiles (base_ms, jitter_ms, spike_prob, error_prob)
 # h2 = fast and reliable, h3 = medium with occasional spikes, h4 = slower/variable
+# Extra servers (h5+) get progressively slower profiles.
 _SERVER_PROFILES = {
     "h2": dict(base_ms=5,  jitter_ms=3,  spike_prob=0.05, error_prob=0.03),
     "h3": dict(base_ms=20, jitter_ms=10, spike_prob=0.10, error_prob=0.05),
     "h4": dict(base_ms=40, jitter_ms=20, spike_prob=0.15, error_prob=0.04),
 }
+# Auto-fill profiles for h5, h6, ... up to NUM_SERVERS servers
+for _idx in range(3, NUM_SERVERS):
+    _hname = f"h{_idx + 2}"
+    if _hname not in _SERVER_PROFILES:
+        # Spread extra servers between h4 (40ms) and ~80ms, then plateau
+        _base = min(80, 40 + 5 * (_idx - 2))
+        _jitter = min(25, 20 + 2 * (_idx - 2))
+        _SERVER_PROFILES[_hname] = dict(
+            base_ms=_base,
+            jitter_ms=_jitter,
+            spike_prob=min(0.20, 0.15 + 0.01 * (_idx - 2)),
+            error_prob=0.05,
+        )
 
 
 def _write_server_script(host_name: str, host_ip: str) -> str:
@@ -200,6 +222,11 @@ def wait_for_controller(client, retries=20, interval=1.0):
 
 def run_requests(client, n):
     """Fire n sequential HTTP GETs from the client host. Returns list of dicts."""
+    server_names = [f"h{2 + i}" for i in range(NUM_SERVERS)]
+    bar_map = {name: chr(0x2460 + i) for i, name in enumerate(server_names)}
+    bar_map["error"] = "✗"
+    bar_map["other"] = "?"
+
     records = []
     print(f"\nFiring {n} sequential HTTP GETs to http://{VIP}:{HTTP_PORT}/")
     for i in range(1, n + 1):
@@ -209,11 +236,16 @@ def run_requests(client, n):
         ).strip()
         elapsed = time.time() - t0
 
-        if   "served by h2" in body: srv = "h2";    status = "ok"
-        elif "served by h3" in body: srv = "h3";    status = "ok"
-        elif "served by h4" in body: srv = "h4";    status = "ok"
-        elif "error" in body.lower(): srv = "error"; status = "error"
-        else:                         srv = "other"; status = "other"
+        srv = "other"
+        status = "other"
+        for name in server_names:
+            if f"served by {name} " in body:   # trailing space avoids h2 matching h20/h21
+                srv = name
+                status = "ok"
+                break
+        if srv == "other" and "error" in body.lower():
+            srv = "error"
+            status = "error"
 
         records.append({
             "req": i,
@@ -222,7 +254,7 @@ def run_requests(client, n):
             "elapsed_s": round(elapsed, 4),
             "body": body[:80],
         })
-        bar = {"h2": "■", "h3": "▲", "h4": "●", "error": "✗", "other": "?"}[srv]
+        bar = bar_map.get(srv, "?")
         tag = f"  \033[31m[500]\033[0m" if status == "error" else ""
         print(f"  [{i:3d}] {bar} {srv}  ({elapsed*1000:.0f} ms){tag}")
         if REQUEST_DELAY > 0 and i < n:
@@ -268,7 +300,9 @@ def main():
         save_csv(records, REQUESTS_CSV)
 
         # Summary
-        counts = {"h2": 0, "h3": 0, "h4": 0, "error": 0, "other": 0}
+        counts: dict = {f"h{2 + i}": 0 for i in range(NUM_SERVERS)}
+        counts["error"] = 0
+        counts["other"] = 0
         for r in records:
             counts[r["server"]] = counts.get(r["server"], 0) + 1
         print("\nSummary:")

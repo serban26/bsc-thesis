@@ -11,26 +11,19 @@ except ImportError:  # pragma: no cover
 
 
 class RoundRobinAlgorithm(LoadBalancingAlgorithm):
-    """Weighted round robin.  Each backend gets weight N picks before moving on."""
+    """Simple Round Robin.
+
+    Cycles through backends one by one, ignoring weights.  Every backend
+    receives exactly the same number of requests regardless of capacity.
+    This is a *static* algorithm: no live metrics are read.
+    """
 
     name = "round_robin"
 
     def __init__(self) -> None:
         self._cursor: int = 0
-        self._picks_in_round: int = 0
 
     def select(self, servers: Sequence[ServerMetrics]) -> ServerMetrics:
-        n = len(servers)
-        if self._cursor >= n:
-            self._cursor = 0
-            self._picks_in_round = 0
-
-        chosen = servers[self._cursor]
-        budget = max(1, int(round(chosen.weight)))
-
-        self._picks_in_round += 1
-        if self._picks_in_round >= budget:
-            self._cursor = (self._cursor + 1) % n
-            self._picks_in_round = 0
-
+        chosen = servers[self._cursor % len(servers)]
+        self._cursor += 1
         return chosen

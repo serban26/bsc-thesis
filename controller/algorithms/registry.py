@@ -4,11 +4,15 @@ from typing import Dict, List, Type
 
 from .base import LoadBalancingAlgorithm
 from .round_robin import RoundRobinAlgorithm
+from .weighted_round_robin import WeightedRoundRobinAlgorithm
 from .least_connections import LeastConnectionsAlgorithm
+from .least_response_time import LeastResponseTimeAlgorithm
 
 _REGISTRY: Dict[str, Type[LoadBalancingAlgorithm]] = {
     RoundRobinAlgorithm.name: RoundRobinAlgorithm,
+    WeightedRoundRobinAlgorithm.name: WeightedRoundRobinAlgorithm,
     LeastConnectionsAlgorithm.name: LeastConnectionsAlgorithm,
+    LeastResponseTimeAlgorithm.name: LeastResponseTimeAlgorithm,
 }
 
 

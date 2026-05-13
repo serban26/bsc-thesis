@@ -24,31 +24,57 @@ ask() {
 # ── interactive prompts ───────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}  SDN Load Balancer — experiment setup${RESET}"
-echo -e "  ───────────────────────────────────────"
+echo -e "  ──────────────────────────────────────────────────"
 echo ""
 echo -e "  ${BOLD}Algorithm${RESET}"
-echo -e "    1) round_robin only"
-echo -e "    2) least_connections only"
-echo -e "    3) both  ${DIM}(runs twice, same traffic, then compares)${RESET}"
-read -rp "$(echo -e "  ${CYAN}?${RESET} Choose [1/2/3]: ")" _algo_choice
+echo -e "    1) round_robin           — simple cycle, equal distribution"
+echo -e "    2) weighted_round_robin  — cycle weighted by server capacity"
+echo -e "    3) least_connections     — always pick least-loaded backend"
+echo -e "    4) least_response_time   — always pick fastest-responding backend"
+echo -e "    5) all four              — run each in sequence, then compare"
+echo ""
+read -rp "$(echo -e "  ${CYAN}?${RESET} Choose [1/2/3/4/5]: ")" _algo_choice
 case "$_algo_choice" in
-    2) ALGOS=("least_connections") ;;
-    3) ALGOS=("round_robin" "least_connections") ;;
+    2) ALGOS=("weighted_round_robin") ;;
+    3) ALGOS=("least_connections") ;;
+    4) ALGOS=("least_response_time") ;;
+    5) ALGOS=("round_robin" "weighted_round_robin" "least_connections" "least_response_time") ;;
     *) ALGOS=("round_robin") ;;
 esac
 
+echo ""
+echo -e "  ${BOLD}Traffic parameters${RESET}"
 NUM_REQUESTS=$(ask "Number of HTTP requests per run" "30")
 REQUEST_DELAY=$(ask "Delay between requests (seconds)" "0.5")
+
+echo ""
+echo -e "  ${BOLD}Backend servers${RESET}"
+NUM_SERVERS=$(ask "Number of backend servers (h2..hN)" "3")
+
+echo ""
+echo -e "  ${BOLD}Backend weights${RESET}  ${DIM}(max weight for h2; each subsequent server decreases by 1, floor 1)${RESET}"
+MAX_WEIGHT=$(ask "Max weight for h2" "3")
+
+# Auto-generate descending weights: MAX_WEIGHT, MAX_WEIGHT-1, ..., floor at 1
+WEIGHTS=""
+for ((i=0; i<NUM_SERVERS; i++)); do
+    w=$((MAX_WEIGHT - i))
+    [[ $w -lt 1 ]] && w=1
+    WEIGHTS="${WEIGHTS:+$WEIGHTS,}$w"
+done
+
 DRAIN_SECS=5
 
 echo ""
 echo -e "  ${GREEN}▶  algorithm(s) :${RESET} ${ALGOS[*]}"
+echo -e "  ${GREEN}▶  servers      :${RESET} $NUM_SERVERS  (h2 … h$((NUM_SERVERS + 1)))"
 echo -e "  ${GREEN}▶  requests     :${RESET} $NUM_REQUESTS"
 echo -e "  ${GREEN}▶  delay        :${RESET} ${REQUEST_DELAY}s between requests"
+echo -e "  ${GREEN}▶  weights      :${RESET} $WEIGHTS"
 echo ""
 read -rp "$(echo -e "  ${CYAN}?${RESET} Press Enter to start (Ctrl-C to cancel) ")" _
 
-# ── cleanup helper ────────────────────────────────────────────────────────
+# ── cleanup helpers ───────────────────────────────────────────────────────
 stop_ryu() {
     if [[ -f "$RYU_PID_FILE" ]]; then
         kill "$(cat "$RYU_PID_FILE")" 2>/dev/null || true
@@ -66,9 +92,9 @@ trap cleanup EXIT
 
 source .venv/bin/activate
 
-# ── wipe previous results ────────────────────────────────────────────────
+# ── wipe previous results ─────────────────────────────────────────────────
 echo -e "${BOLD}Clearing previous results…${RESET}"
-rm -rf results/
+sudo rm -rf results/
 mkdir -p results/
 
 # ── run each algorithm ────────────────────────────────────────────────────
@@ -86,6 +112,8 @@ for ALGO in "${ALGOS[@]}"; do
     echo -e "${BOLD}[2/3] Starting Ryu (${ALGO})…${RESET}"
     LB_ALGORITHM="$ALGO" \
     LB_METRICS_FILE="$METRICS_FILE" \
+    LB_WEIGHTS="$WEIGHTS" \
+    LB_NUM_SERVERS="$NUM_SERVERS" \
         "$VENV_RYU" --observe-links controller/load_balancer.py \
         > "$RYU_LOG" 2>&1 &
     echo "$!" > "$RYU_PID_FILE"
@@ -104,6 +132,7 @@ for ALGO in "${ALGOS[@]}"; do
     LB_DRAIN="$DRAIN_SECS" \
     LB_DELAY="$REQUEST_DELAY" \
     LB_REQUESTS_CSV="$REQUESTS_CSV" \
+    LB_NUM_SERVERS="$NUM_SERVERS" \
         sudo -E python3 topo/run_net_auto.py
 
     sleep 2
@@ -112,21 +141,26 @@ for ALGO in "${ALGOS[@]}"; do
 
     echo ""
     echo -e "  Generating per-algorithm plots…"
+    LB_NUM_SERVERS="$NUM_SERVERS" \
     "$VENV_PYTHON" scripts/plot_metrics.py \
         --metrics "$METRICS_FILE" \
         --requests "$REQUESTS_CSV" \
         --out "results/${ALGO}"
 done
 
-# ── comparison plots (only when both algorithms ran) ──────────────────────
-if [[ ${#ALGOS[@]} -eq 2 ]]; then
+# ── comparison plots (only when more than one algorithm ran) ──────────────
+if [[ ${#ALGOS[@]} -gt 1 ]]; then
     echo ""
     echo -e "${BOLD}━━━  Generating comparison plots  ━━━━━━━━━━━━━━━━━━━━━${RESET}"
+
+    ALGO_ARGS=()
+    for ALGO in "${ALGOS[@]}"; do
+        ALGO_ARGS+=("--algo" "$ALGO" "/tmp/lb_metrics_${ALGO}.jsonl" "/tmp/lb_requests_${ALGO}.csv")
+    done
+
+    LB_NUM_SERVERS="$NUM_SERVERS" \
     "$VENV_PYTHON" scripts/plot_comparison.py \
-        --rr-metrics  "/tmp/lb_metrics_round_robin.jsonl" \
-        --rr-requests "/tmp/lb_requests_round_robin.csv" \
-        --lc-metrics  "/tmp/lb_metrics_least_connections.jsonl" \
-        --lc-requests "/tmp/lb_requests_least_connections.csv" \
+        "${ALGO_ARGS[@]}" \
         --out "results/comparison"
 fi
 
@@ -135,43 +169,7 @@ echo -e "${GREEN}${BOLD}  Done.${RESET}"
 for ALGO in "${ALGOS[@]}"; do
     echo -e "  ${DIM}results/${ALGO}/${RESET}"
 done
-if [[ ${#ALGOS[@]} -eq 2 ]]; then
+if [[ ${#ALGOS[@]} -gt 1 ]]; then
     echo -e "  ${DIM}results/comparison/${RESET}"
 fi
 echo ""
-
-
-VENV_PYTHON="$(pwd)/.venv/bin/python"
-VENV_RYU="$(pwd)/.venv/bin/ryu-manager"
-
-RYU_LOG="/tmp/lb_ryu.log"
-METRICS_FILE="/tmp/lb_metrics.jsonl"
-REQUESTS_CSV="/tmp/lb_requests.csv"
-RYU_PID_FILE="/tmp/lb_ryu.pid"
-
-# ── colours ──────────────────────────────────────────────────────────────
-BOLD="\033[1m"
-CYAN="\033[1;36m"
-GREEN="\033[1;32m"
-YELLOW="\033[1;33m"
-RESET="\033[0m"
-
-ask() {
-    # ask <prompt> <default>  → echoes the answer
-    local prompt="$1" default="$2" answer
-    read -rp "$(echo -e "  ${CYAN}?${RESET} ${prompt} ${YELLOW}[${default}]${RESET}: ")" answer
-    echo "${answer:-$default}"
-}
-
-pick_algorithm() {
-    echo -e "\n  ${BOLD}Algorithm${RESET}" >&2
-    echo -e "    1) round_robin        — cycle through backends in order" >&2
-    echo -e "    2) least_connections  — always pick the least loaded backend" >&2
-    local choice
-    read -rp "$(echo -e "  ${CYAN}?${RESET} Choose [1/2]: ")" choice
-    case "$choice" in
-        2) echo "least_connections" ;;
-        *) echo "round_robin" ;;
-    esac
-}
-

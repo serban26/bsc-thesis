@@ -13,7 +13,7 @@
 \usepackage[section]{placeins}
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{graphicx}
-\graphicspath{{results/round_robin/}{results/comparison/}{results/least_connections/}{figures/}}
+\graphicspath{{figures/}}
 \usepackage{float}
 \usepackage{subcaption}
 \usepackage{booktabs}
@@ -127,11 +127,10 @@
 \begin{center}
 
 \hrulefill\\
-\Huge{SDN-Based Adaptive Load Balancing:\\
-Implementing and Comparing Scheduling\\
-Algorithms in an Emulated Network}\\
+\Huge{Dynamic Bandwidth Allocation in\\
+    Software-Defined Networks (SDN)}\\
 \bigskip
-\Large{Bachelor's Thesis --- Computing Science}\\
+\Large{Bachelor's Thesis, Computing Science}\\
 \bigskip
 \href{https://github.com/serban26/bsc-thesis}{\texttt{GitHub Repository}}\\
 \hrulefill\\
@@ -142,7 +141,11 @@ Algorithms in an Emulated Network}\\
 \vspace{0.75cm}
 \textbf{\Large Supervisor:}\\
 \vspace{0.5cm}
-\textit{[Supervisor name]}\\
+\textit{Reza-Zare Hassanpour}\\
+\vspace{0.75cm}
+\textbf{\Large Second Supervisor:}\\
+\vspace{0.5cm}
+\textit{Fadi Mohsen}\\
 
 \vspace{4cm}
 \mydate{\today}
@@ -154,7 +157,7 @@ Algorithms in an Emulated Network}\\
 \begin{abstract}
 Traffic load balancing is one of those problems that sounds simple until you
 actually try to implement it properly. Spreading incoming requests across multiple
-servers is easy in theory --- just take turns --- but doing it in a way that adapts
+servers is easy in theory, just take turns, but doing it in a way that adapts
 to real conditions requires visibility into the network that traditional load balancers
 simply do not have.
 
@@ -195,7 +198,7 @@ Ryu, Mininet, round robin, least connections, network emulation.
 
 When a web service gets popular, one server is never enough. The standard solution
 is to put multiple servers behind a single address and distribute the incoming requests
-across them. The component that does this --- the load balancer --- is a surprisingly
+across them. The component that does this, the load balancer, is a surprisingly
 interesting piece of networking infrastructure, because it has to make per-connection
 decisions at high speed while keeping track of which backends are actually available
 and how loaded they are.
@@ -209,8 +212,8 @@ server load. Hardware appliances are more capable but are expensive, opaque, and
 difficult to modify.
 
 Software-Defined Networking (SDN) offers a different perspective. The central idea is
-to separate the \emph{control plane} --- the logic deciding where traffic goes --- from
-the \emph{data plane} --- the equipment that actually forwards it
+to separate the \emph{control plane}, the logic deciding where traffic goes, from
+the \emph{data plane}, the equipment that actually forwards it
 \citep{mckeown2008openflow, kreutz2015sdn}. The control plane runs as software on a
 standard server (the SDN controller), and the switches become programmable forwarding
 elements that execute rules sent by the controller via a standardised protocol (OpenFlow).
@@ -218,7 +221,7 @@ elements that execute rules sent by the controller via a standardised protocol (
 This architecture is a natural fit for load balancing. The controller sees every new
 flow, can read real-time statistics from switches, and installs per-flow rules that
 rewrite packet headers on the fly \citep{handigol2009openflow_lb, zhou2014sdn_lb}.
-Changing the scheduling algorithm means changing a few lines of Python --- no hardware
+Changing the scheduling algorithm means changing a few lines of Python, no hardware
 involved.
 
 \subsection{Project Overview}
@@ -227,11 +230,11 @@ This thesis describes the design and implementation of an SDN-based HTTP load
 balancer. The emulation stack consists of three open-source components:
 
 \begin{itemize}
-\item \textbf{Mininet}~\citep{lantz2010mininet} --- creates virtual hosts and links
+\item \textbf{Mininet}~\citep{lantz2010mininet}, creates virtual hosts and links
   on a single Linux machine using network namespaces.
-\item \textbf{Open vSwitch (OVS)}~\citep{pfaff2015ovs} --- a software OpenFlow switch
+\item \textbf{Open vSwitch (OVS)}~\citep{pfaff2015ovs}, a software OpenFlow switch
   that executes flow rules and reports statistics.
-\item \textbf{Ryu}~\citep{ryu2023} --- a Python SDN controller framework.
+\item \textbf{Ryu}~\citep{ryu2023}, a Python SDN controller framework.
 \end{itemize}
 
 The system exposes a single \emph{Virtual IP} (VIP, \texttt{10.0.0.100}) to the client.
@@ -284,7 +287,7 @@ OpenFlow~1.3~\citep{of13spec}. Figure~\ref{fig:arch} shows the structure.
   layer/.style={draw=gray!40, dashed, rounded corners=5pt, inner sep=5pt}
 ]
   \node[box,fill=blue!12]  (ryu) at (0,0)    {Ryu controller};
-  \node[box,fill=blue!8]   (alg) at (-2.2,0) {Algorithm\\RR / LC};
+  \node[box,fill=blue!8]   (alg) at (-2.2,0) {Algorithm};
   \node[box,fill=blue!8]   (met) at ( 2.2,0) {Metrics\\module};
   \draw[arr]  (alg) -- (ryu) node[midway,above,font=\tiny]{select()};
   \draw[darr] (ryu) -- (met) node[midway,above,font=\tiny]{snapshot};
@@ -397,7 +400,7 @@ central registry, selectable via the \texttt{LB\_ALGORITHM} environment variable
 \subsubsection{Weighted Round Robin}
 A cursor advances through the server list one step per request. For weight $w > 1$,
 a server is picked $w$ consecutive times before the cursor moves. The algorithm never
-reads any metric --- it is fully oblivious to current load. Predictable and simple, but
+reads any metric, it is fully oblivious to current load. Predictable and simple, but
 cannot adapt.
 
 \subsubsection{Least Connections}
@@ -422,18 +425,18 @@ duration.
 \centering
 \caption{Per-server metrics tracked by the controller.}
 \label{tab:metrics}
-\begin{tabular}{lll}
+\begin{tabular}{ll}
 \toprule
-\textbf{Metric} & \textbf{Unit} & \textbf{Source} \\
+\textbf{Metric} & \textbf{Unit}\\
 \midrule
-active\_conns     & conns  & FlowRemoved \\
-total\_bytes      & bytes  & FlowRemoved \\
-total\_packets    & pkts   & FlowRemoved \\
-throughput\_bps   & bit/s  & PortStats (EWMA) \\
-conn\_rate\_eps   & conn/s & select() (EWMA) \\
-avg\_flow\_dur\_s & s      & FlowRemoved (EWMA) \\
-port\_errors      & count  & PortStats \\
-selections\_total & count  & select() \\
+active\_conns     & conns  \\
+total\_bytes      & bytes   \\
+total\_packets    & pkts    \\
+throughput\_bps   & bit/s   \\
+conn\_rate\_eps   & conn/s  \\
+avg\_flow\_dur\_s & s     \\
+port\_errors      & count  \\
+selections\_total & count   \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -513,7 +516,7 @@ Requests are sent sequentially from \texttt{h1} via \texttt{curl} with a 0.5\,s
 inter-request gap. Each request is timed and its response body is parsed to identify
 the serving backend. Three warm-up requests (discarded) populate ARP tables before
 the measured phase. The controller readiness check verifies that port 6633 is bound
-via \texttt{ss} --- no packets go through the switch, so the algorithm cursor is not
+via \texttt{ss}, no packets go through the switch, so the algorithm cursor is not
 advanced before the first real request. A 5\,s drain period after the last request
 allows all flows to expire cleanly.
 
@@ -539,58 +542,60 @@ Adding unequal server weights is another planned extension.
 \section{Results}
 \label{sec:results}
 
-\subsection{Traffic Distribution}
+\subsection{Traffic Distribution and Response Times}
 
-Figure~\ref{fig:dist_rr} shows request counts per backend for a 50-request Round
+Figure~\ref{fig:dist_rr} shows request counts per backend for a 30-request Round
 Robin run. With equal weights and sequential arrivals the expected distribution is
 one-third each, which the result closely matches.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{01_request_distribution.png}
-\caption{Request distribution for Round Robin (50 requests).}
-\label{fig:dist_rr}
-\end{figure}
-
-\subsection{Response Times}
-
 Figure~\ref{fig:lat_rr} shows per-request latencies. Three distinct bands are visible,
 confirming that the server and link profiles produce the intended differentiation between
 backends.
 
-\begin{figure}[t]
+\begin{figure*}[t]
 \centering
-\includegraphics[width=\columnwidth]{02_response_times.png}
-\caption{Per-request response times for Round Robin. Each backend forms a distinct
-  latency band.}
-\label{fig:lat_rr}
-\end{figure}
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{round_robin/01_request_distribution.png}
+  \caption{Request distribution for Round Robin (30 requests).}
+  \label{fig:dist_rr}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{round_robin/02_response_times.png}
+  \caption{Per-request response times. Each backend forms a distinct latency band.}
+  \label{fig:lat_rr}
+\end{subfigure}
+\caption{Round Robin: traffic distribution (left) and per-request latencies (right).}
+\label{fig:rr_dist_lat}
+\end{figure*}
 
-\subsection{Active Connections Over Time}
+\subsection{Active Connections and Cumulative Selections}
 
 Figure~\ref{fig:ac_rr} shows active connection counts from the event stream. Under
 sequential traffic the signal oscillates 0~$\to$~1; the cyclic pattern identifies which
 server is holding the current connection.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{03_active_conns.png}
-\caption{Active connections per backend over time (Round Robin).}
-\label{fig:ac_rr}
-\end{figure}
-
-\subsection{Cumulative Selections}
-
-For equal-weight RR the three selection curves grow in parallel
+For equal-weight RR the three cumulative selection curves grow in parallel
 (Figure~\ref{fig:cum_rr}), confirming the strict cyclic order.
 
-\begin{figure}[t]
+\begin{figure*}[t]
 \centering
-\includegraphics[width=\columnwidth]{04_cumulative_selections.png}
-\caption{Cumulative backend selections over time (Round Robin). Equal weights produce
-  three parallel lines.}
-\label{fig:cum_rr}
-\end{figure}
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{round_robin/03_active_conns.png}
+  \caption{Active connections per backend over time (Round Robin).}
+  \label{fig:ac_rr}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{round_robin/04_cumulative_selections.png}
+  \caption{Cumulative backend selections. Equal weights produce three parallel lines.}
+  \label{fig:cum_rr}
+\end{subfigure}
+\caption{Round Robin: active connections (left) and cumulative selections (right).}
+\label{fig:rr_ac_cum}
+\end{figure*}
 
 \subsection{Bytes Transferred}
 
@@ -599,7 +604,7 @@ produce parallel growth lines; deviations would indicate unequal distribution.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\columnwidth]{06_total_bytes.png}
+\includegraphics[width=\columnwidth]{round_robin/06_total_bytes.png}
 \caption{Cumulative bytes per backend (Round Robin).}
 \label{fig:bytes_rr}
 \end{figure}
@@ -607,42 +612,52 @@ produce parallel growth lines; deviations would indicate unequal distribution.
 \subsection{Algorithm Comparison}
 
 Figures~\ref{fig:cmp_lat}--\ref{fig:cmp_err} compare RR and LC. Under sequential
-load the distributions are similar --- as expected, since LC reduces to random
+load the distributions are similar, as expected, since LC reduces to random
 selection when all $\ell_i = 0$. The figures provide a correct baseline and confirm
 that both algorithms work. The meaningful comparison requires concurrent-load
 experiments (future work).
 
-\begin{figure}[t]
+\begin{figure*}[t]
 \centering
-\includegraphics[width=\columnwidth]{cmp_01_latency_distribution.png}
-\caption{Latency distributions per backend: Round Robin vs.\ Least Connections.}
-\label{fig:cmp_lat}
-\end{figure}
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{comparison/cmp_01_latency_distribution.png}
+  \caption{Latency distributions per backend: RR vs.\ LC.}
+  \label{fig:cmp_lat}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{comparison/cmp_02_mean_latency.png}
+  \caption{Mean response latency per backend for both algorithms.}
+  \label{fig:cmp_mean}
+\end{subfigure}
+\caption{Comparison: latency distributions (left) and mean latency per backend (right).}
+\label{fig:cmp_lat_mean}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{comparison/cmp_03_request_distribution.png}
+  \caption{Total requests per backend under RR and LC.}
+  \label{fig:cmp_dist}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{comparison/cmp_05_latency_over_time.png}
+  \caption{Latency over time, coloured by backend.}
+  \label{fig:cmp_time}
+\end{subfigure}
+\caption{Comparison: request distribution (left) and latency over time (right).}
+\label{fig:cmp_dist_time}
+\end{figure*}
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\columnwidth]{cmp_02_mean_latency.png}
-\caption{Mean response latency per backend for both algorithms.}
-\label{fig:cmp_mean}
-\end{figure}
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{cmp_03_request_distribution.png}
-\caption{Total requests per backend under RR and LC.}
-\label{fig:cmp_dist}
-\end{figure}
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{cmp_05_latency_over_time.png}
-\caption{Latency over time, coloured by backend.}
-\label{fig:cmp_time}
-\end{figure}
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{cmp_06_error_rate.png}
+\includegraphics[width=\columnwidth]{comparison/cmp_06_error_rate.png}
 \caption{500 errors per backend for both algorithms.}
 \label{fig:cmp_err}
 \end{figure}
