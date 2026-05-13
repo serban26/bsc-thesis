@@ -114,9 +114,18 @@ def _write_server_script(host_name: str, host_ip: str) -> str:
     body = f"served by {host_name} ({host_ip})"
     p = _SERVER_PROFILES.get(host_name, dict(base_ms=10, jitter_ms=5,
                                               spike_prob=0.05, error_prob=0.03))
+    # Deterministic per-server seed derived from the host name.
+    # Every algorithm run starts the same server with the same seed,
+    # so the sequence of delays/errors is identical across runs.
+    # Different servers still behave differently (different profiles AND seeds).
+    seed_val = sum(ord(c) * (i + 1) for i, c in enumerate(host_name))
     script = f"""\
 #!/usr/bin/env python3
 import http.server, socketserver, time, random
+
+# Fixed seed — same for every algorithm run that uses this server,
+# so delay/error sequences are reproducible and comparable.
+random.seed({seed_val})
 
 BODY       = b"{body}\\n"
 PORT       = {HTTP_PORT}
@@ -290,10 +299,11 @@ def main():
         if not wait_for_controller(h1):
             print("[WARN] controller did not respond; continuing anyway")
 
-        # 3 warm-up requests so ARP converges on server→client direction too
-        print("\nWarm-up (3 requests, responses discarded)…")
-        for _ in range(3):
-            h1.cmd(f"curl -s --max-time 5 -o /dev/null http://{VIP}:{HTTP_PORT}/")
+        # Warm-up: hit each server directly (not via VIP) so ARP converges
+        # without advancing the load-balancer cursor.
+        print("\nWarm-up (direct ARP probe, load balancer not touched)…")
+        for s in servers:
+            h1.cmd(f"curl -s --max-time 3 -o /dev/null http://{s.IP()}:{HTTP_PORT}/")
         time.sleep(0.5)
 
         records = run_requests(h1, NUM_REQUESTS)

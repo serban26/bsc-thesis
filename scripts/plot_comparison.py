@@ -34,6 +34,25 @@ PRETTY = {
 def algo_label(name):
     return PRETTY.get(name, name.replace("_", " ").title())
 
+def load_metrics(path):
+    """Return list of flow_removed events from a JSONL metrics file."""
+    events = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("event") == "flow_removed":
+                    events.append(obj)
+    except FileNotFoundError:
+        pass
+    return events
+
 def load_requests(path):
     rows = []
     try:
@@ -159,6 +178,78 @@ def plot_error_rate(datasets, out_dir):
                 ha="center", va="center", fontsize=12, color="gray")
     fig.tight_layout(); _save(fig, out_dir / "cmp_05_error_rate.png")
 
+def plot_utilization_efficiency(datasets_req, datasets_metrics, out_dir):
+    """Bar: mean server utilisation per algorithm.
+
+    utilisation_i = sum(duration_s for server i) / experiment_duration
+    mean_util      = average across all servers
+    std_util       = spread (lower = more balanced load)
+
+    A higher mean utilisation means the algorithm kept servers busier
+    (better throughput); a lower std means work was spread more evenly.
+    """
+    algos = list(datasets_req)
+    means, stds = [], []
+
+    for algo in algos:
+        flow_evts = datasets_metrics.get(algo, [])
+        req_evts  = datasets_req[algo]
+
+        # Experiment duration from request timestamps (or flow events)
+        if req_evts:
+            times = [r.get("t", 0) for r in req_evts if "t" in r]
+            if not times and flow_evts:
+                times = [e["t"] for e in flow_evts]
+        else:
+            times = [e["t"] for e in flow_evts]
+
+        # Fallback: use elapsed_s span as proxy for experiment duration
+        if not times and req_evts:
+            elapsed = [r["elapsed_s"] for r in req_evts]
+            exp_dur = sum(elapsed)          # sequential requests
+        else:
+            exp_dur = (max(times) - min(times)) if len(times) >= 2 else 1.0
+
+        exp_dur = max(exp_dur, 1e-6)
+
+        busy = {n: 0.0 for n in SERVER_NAMES}
+        for ev in flow_evts:
+            name = ev.get("server")
+            dur  = ev.get("duration_s", 0.0)
+            if name in busy:
+                busy[name] += dur
+
+        utils = [min(1.0, busy[n] / exp_dur) for n in SERVER_NAMES]
+        m = sum(utils) / len(utils) if utils else 0
+        s = math.sqrt(sum((u - m) ** 2 for u in utils) / len(utils)) if len(utils) > 1 else 0
+        means.append(m * 100)
+        stds.append(s * 100)
+
+    x = np.arange(len(algos))
+    fig, ax = plt.subplots(figsize=(max(6, 2 * len(algos)), 5))
+    bars = ax.bar(x, means, yerr=stds, capsize=5,
+                  color=[_PALETTE[i % len(_PALETTE)] for i in range(len(algos))],
+                  alpha=0.85, edgecolor="white",
+                  error_kw=dict(elinewidth=1.2, label="std across servers"))
+    for bar, v, s in zip(bars, means, stds):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + s + 0.5,
+                f"{v:.1f}%", ha="center", va="bottom",
+                fontsize=10, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels([algo_label(a) for a in algos], fontsize=11)
+    ax.set_ylabel("Mean server utilisation (%)")
+    ax.set_ylim(0, min(100, max(means, default=0) * 1.25 + 5))
+    ax.set_title(
+        f"Server utilisation efficiency — {_num_servers} backends\n"
+        "(busy time / experiment duration, averaged across servers; "
+        "error bars = std dev across servers)"
+    )
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save(fig, out_dir / "cmp_06_utilization.png")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--algo", nargs=3, action="append", metavar=("NAME", "METRICS", "REQUESTS"))
@@ -168,13 +259,15 @@ def main():
         ap.error("Provide at least one --algo name metrics.jsonl requests.csv")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    datasets_req = {name: load_requests(rpath) for name, _, rpath in args.algo}
+    datasets_req     = {name: load_requests(rpath)  for name, _, rpath   in args.algo}
+    datasets_metrics = {name: load_metrics(mpath)    for name, mpath, _   in args.algo}
     print(f"\nWriting comparison plots to {out_dir}/")
     plot_mean_latency(datasets_req, out_dir)
     plot_latency_distribution(datasets_req, out_dir)
     plot_latency_over_time(datasets_req, out_dir)
     plot_fairness(datasets_req, out_dir)
     plot_error_rate(datasets_req, out_dir)
+    plot_utilization_efficiency(datasets_req, datasets_metrics, out_dir)
     print("Done.")
 
 if __name__ == "__main__":

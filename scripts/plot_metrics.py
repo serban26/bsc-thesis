@@ -4,6 +4,10 @@ Plot results from a load-balancer experiment run.
 
 Usage:
     python3 scripts/plot_metrics.py [--metrics FILE] [--requests FILE] [--out DIR]
+
+Scale-safe: works for any number of backends (3 … 100+).
+Legends list server names only when N <= 12; for larger pools a
+colour-bar (server index) is shown instead.
 """
 
 from __future__ import annotations
@@ -16,42 +20,47 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# ── try to import matplotlib; give a helpful message if missing ───────────
 try:
     import matplotlib
-    matplotlib.use("Agg")          # headless — no display required
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.ticker as ticker
+    import matplotlib.cm as cm
+    import numpy as np
 except ImportError:
-    print("matplotlib not found. Install with:  pip install matplotlib", file=sys.stderr)
+    print("matplotlib not found.  pip install matplotlib", file=sys.stderr)
     sys.exit(1)
 
-# ── colour palette (consistent across all plots) ─────────────────────────
-_EXTRA_COLORS  = ["#C44E52", "#8172B3", "#937860", "#CCB974", "#64B5CD"]
-_EXTRA_MARKERS = ["D", "v", "P", "X", "*"]
-
+# ── server list & colour assignment ──────────────────────────────────────
 _num_servers = int(os.environ.get("LB_NUM_SERVERS", "3"))
 SERVER_NAMES = [f"h{2 + i}" for i in range(_num_servers)]
 
-_base_colors  = {"h2": "#4C72B0", "h3": "#DD8452", "h4": "#55A868"}
-_base_markers = {"h2": "o",       "h3": "s",       "h4": "^"}
-COLORS  = {name: _base_colors.get(name,  _EXTRA_COLORS[i % len(_EXTRA_COLORS)])
-           for i, name in enumerate(SERVER_NAMES)}
-MARKERS = {name: _base_markers.get(name, _EXTRA_MARKERS[i % len(_EXTRA_MARKERS)])
+# For small pools use a categorical palette; for large pools use a smooth
+# colormap so the legend can be replaced by a colorbar.
+_LEGEND_THRESHOLD = 12   # show named legend up to this many servers
+
+_cmap = cm.get_cmap("tab20" if _num_servers <= 20 else "viridis", _num_servers)
+COLORS  = {name: _cmap(i / max(_num_servers - 1, 1)) for i, name in enumerate(SERVER_NAMES)}
+MARKERS = {name: ["o","s","^","D","v","P","X","*","h","+"][i % 10]
            for i, name in enumerate(SERVER_NAMES)}
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Data loading
-# ─────────────────────────────────────────────────────────────────────────
+def _add_server_legend(ax, drawn_names):
+    """Add legend or colorbar depending on pool size."""
+    if _num_servers <= _LEGEND_THRESHOLD:
+        ax.legend(fontsize=8, ncol=max(1, _num_servers // 6))
+    # For large pools: no legend — colour gradient is self-explanatory
+
+
+def _save(fig, path):
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  {path}")
+
+
+# ── data loaders ─────────────────────────────────────────────────────────
 
 def load_metrics(path: str):
-    """Return (snapshots, selects, flow_removed_events).
-
-    snapshots      : list of {t, servers: [{name, metric…}]}  – 5-s snapshots
-    selects        : list of {event:"select", t, server, …}   – per-request
-    flow_removed   : list of {event:"flow_removed", t, server, active_conns, …}
-    """
     snapshots, selects, flow_removed = [], [], []
     with open(path) as fh:
         for line in fh:
@@ -78,19 +87,15 @@ def load_requests(path: str):
         for row in csv.DictReader(fh):
             row["req"] = int(row["req"])
             row["elapsed_s"] = float(row["elapsed_s"])
-            # backwards-compat: files written before status column was added
             if "status" not in row:
-                row["status"] = "ok" if row["server"] in ("h2", "h3", "h4") else "other"
+                row["status"] = "ok" if row["server"] in SERVER_NAMES else "other"
             rows.append(row)
     return rows
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Helper: extract per-server time series from snapshots
-# ─────────────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────
 
 def ts_for(snapshots, metric: str):
-    """Return {server_name: (times[], values[])} for a given metric key."""
     out = {n: ([], []) for n in SERVER_NAMES}
     for snap in snapshots:
         t = snap["t"]
@@ -102,39 +107,66 @@ def ts_for(snapshots, metric: str):
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Individual plot functions
-# ─────────────────────────────────────────────────────────────────────────
+def _events_to_step(selects, flow_removed, metric="active_conns"):
+    all_events = sorted(
+        [e for e in selects + flow_removed if metric in e],
+        key=lambda e: e["t"]
+    )
+    if not all_events:
+        return {n: ([], []) for n in SERVER_NAMES}
+    t0   = all_events[0]["t"]
+    xs   = {n: [0] for n in SERVER_NAMES}
+    ys   = {n: [0] for n in SERVER_NAMES}
+    last = {n: 0   for n in SERVER_NAMES}
+    for ev in all_events:
+        name = ev.get("server")
+        if name not in last:
+            continue
+        t   = ev["t"] - t0
+        val = ev[metric]
+        xs[name].append(t); ys[name].append(last[name])
+        xs[name].append(t); ys[name].append(val)
+        last[name] = val
+    return {n: (xs[n], ys[n]) for n in SERVER_NAMES}
+
+
+# ── individual plots ──────────────────────────────────────────────────────
 
 def plot_request_distribution(requests, out_dir):
-    """Bar chart: how many requests each backend served. Dashed line = ideal."""
     counts = {n: 0 for n in SERVER_NAMES}
     counts["error"] = 0
-    counts["other"] = 0
     for r in requests:
         srv = r["server"]
         if r.get("status") == "error":
-            counts["error"] = counts.get("error", 0) + 1
+            counts["error"] += 1
         else:
             counts[srv] = counts.get(srv, 0) + 1
 
     names  = list(SERVER_NAMES)
-    if counts["error"]: names.append("error")
-    if counts["other"]: names.append("other")
+    if counts["error"]:
+        names.append("error")
     values = [counts[n] for n in names]
-    colors = [COLORS.get(n, "#e05555" if n == "error" else "#999999") for n in names]
+    colors = [COLORS.get(n, "#e05555") for n in names]
 
-    fig, ax = plt.subplots(figsize=(7, 4))
-    bars = ax.bar(names, values, color=colors, edgecolor="white", linewidth=0.8)
-    for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,
-                str(val), ha="center", va="bottom", fontsize=10)
+    # Scale figure width for many servers
+    fig_w = max(7, min(30, 0.4 * len(names)))
+    fig, ax = plt.subplots(figsize=(fig_w, 4))
+    bars = ax.bar(range(len(names)), values, color=colors,
+                  edgecolor="white", linewidth=0.5)
+    # Only annotate bar values when N is small enough to read
+    if len(names) <= 30:
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.2,
+                    str(val), ha="center", va="bottom", fontsize=7)
 
     ok_total = sum(counts[n] for n in SERVER_NAMES)
     ideal = ok_total / len(SERVER_NAMES)
     ax.axhline(ideal, color="black", linestyle="--", linewidth=1.2,
                label=f"Ideal ({ideal:.0f} each)")
 
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels(names, rotation=90 if len(names) > 10 else 0, fontsize=7)
     ax.set_title("Request distribution per backend")
     ax.set_ylabel("Requests served")
     ax.set_xlabel("Backend")
@@ -145,7 +177,6 @@ def plot_request_distribution(requests, out_dir):
 
 
 def plot_response_times(requests, out_dir):
-    """Left: latency scatter coloured by server.  Right: box plot per server."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
 
     by_srv = defaultdict(lambda: ([], []))
@@ -154,23 +185,24 @@ def plot_response_times(requests, out_dir):
         by_srv[srv][0].append(r["req"])
         by_srv[srv][1].append(r["elapsed_s"] * 1000)
 
+    drawn = []
     for name in SERVER_NAMES:
         xs, ys = by_srv[name]
         if xs:
-            ax1.scatter(xs, ys, label=name, color=COLORS[name],
-                        marker=MARKERS[name], s=30, alpha=0.85)
-    # plot errors in red
+            sc = ax1.scatter(xs, ys, color=COLORS[name],
+                             marker=MARKERS[name], s=25, alpha=0.8,
+                             label=name if _num_servers <= _LEGEND_THRESHOLD else "_")
+            drawn.append(name)
     if by_srv["error"][0]:
         ax1.scatter(*by_srv["error"], label="500 error", color="#e05555",
                     marker="x", s=50, zorder=5)
-    if by_srv["other"][0]:
-        ax1.scatter(*by_srv["other"], label="other", color="#999",
-                    marker="x", s=30)
+        drawn.append("error")
 
     ax1.set_title("Response latency per request")
     ax1.set_xlabel("Request #")
     ax1.set_ylabel("Latency (ms)")
-    ax1.legend(fontsize=9)
+    if _num_servers <= _LEGEND_THRESHOLD or "error" in drawn:
+        ax1.legend(fontsize=8, ncol=max(1, len(drawn) // 6))
     ax1.grid(True, alpha=0.25)
 
     data, labels, cols = [], [], []
@@ -182,73 +214,34 @@ def plot_response_times(requests, out_dir):
             labels.append(n)
             cols.append(COLORS[n])
     if data:
-        bp = ax2.boxplot(data, patch_artist=True, labels=labels, widths=0.5)
+        bp = ax2.boxplot(data, patch_artist=True,
+                         labels=labels if len(labels) <= 20 else [""] * len(labels),
+                         widths=0.5)
         for patch, c in zip(bp["boxes"], cols):
-            patch.set_facecolor(c)
-            patch.set_alpha(0.7)
+            patch.set_facecolor(c); patch.set_alpha(0.7)
+        if len(labels) > 10:
+            ax2.tick_params(axis="x", labelsize=6, rotation=90)
     ax2.set_title("Latency distribution per backend (successful only)")
     ax2.set_ylabel("Latency (ms)")
     ax2.set_xlabel("Backend")
-
     fig.tight_layout()
     _save(fig, out_dir / "02_response_times.png")
 
 
-def _save(fig, path):
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"  {path}")
-
-
-def _events_to_step(selects, flow_removed, metric="active_conns"):
-    """Build per-server step time-series from select + flow_removed events.
-
-    Both event types carry the post-update value of *metric*.  We merge them,
-    sort by t, then emit a step function (xs, ys) per server starting from t=0.
-    """
-    if not selects and not flow_removed:
-        return {n: ([], []) for n in SERVER_NAMES}
-    all_events = sorted(
-        [e for e in selects + flow_removed if metric in e],
-        key=lambda e: e["t"]
-    )
-    t0 = all_events[0]["t"] if all_events else 0
-    # initialise step state at t=0 with value 0
-    xs   = {n: [0] for n in SERVER_NAMES}
-    ys   = {n: [0] for n in SERVER_NAMES}
-    last = {n: 0   for n in SERVER_NAMES}
-    for ev in all_events:
-        name = ev.get("server")
-        if name not in last:
-            continue
-        t   = ev["t"] - t0
-        val = ev[metric]
-        # hold previous value up to this point (step)
-        xs[name].append(t)
-        ys[name].append(last[name])
-        xs[name].append(t)
-        ys[name].append(val)
-        last[name] = val
-    return {n: (xs[n], ys[n]) for n in SERVER_NAMES}
-
-
 def plot_active_conns(selects, flow_removed, out_dir):
-    """Active connections over time — primary signal for least-connections.
-
-    Built from individual select/flow_removed events so the full ramp-up and
-    ramp-down are visible, not just the coarse 5-s snapshots.
-    """
-    ts = _events_to_step(selects, flow_removed, "active_conns")
+    ts  = _events_to_step(selects, flow_removed, "active_conns")
     fig, ax = plt.subplots(figsize=(9, 4))
+    drawn = []
     for name in SERVER_NAMES:
         xs, ys = ts[name]
         if len(xs) > 1:
-            ax.plot(xs, ys, label=name, color=COLORS[name], linewidth=1.8)
-    ax.set_title("Active connections per backend over time\n"
-                 "(key signal for least-connections algorithm)")
+            ax.plot(xs, ys, color=COLORS[name], linewidth=1.5, alpha=0.75,
+                    label=name if _num_servers <= _LEGEND_THRESHOLD else "_")
+            drawn.append(name)
+    ax.set_title("Active connections per backend over time")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Active connections")
-    ax.legend(fontsize=9)
+    _add_server_legend(ax, drawn)
     ax.grid(True, alpha=0.3)
     ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
     fig.tight_layout()
@@ -256,97 +249,150 @@ def plot_active_conns(selects, flow_removed, out_dir):
 
 
 def plot_cumulative_selections(selects, out_dir):
-    """Cumulative picks per backend — shows the rotation shape over time.
-
-    Each step up means one new request was assigned to that backend.  For
-    perfect round-robin the three lines should climb as a tight parallel staircase.
-    """
     if not selects:
         return
     t0  = selects[0]["t"]
     cum = {n: 0 for n in SERVER_NAMES}
-    time_series = {n: [0] for n in SERVER_NAMES}
-    val_series  = {n: [0] for n in SERVER_NAMES}
+    ts  = {n: [0] for n in SERVER_NAMES}
+    vs  = {n: [0] for n in SERVER_NAMES}
     for ev in selects:
         n = ev.get("server")
         if n in cum:
             cum[n] += 1
             t = ev["t"] - t0
             for name in SERVER_NAMES:
-                time_series[name].append(t)
-                val_series[name].append(cum[name])
+                ts[name].append(t)
+                vs[name].append(cum[name])
     fig, ax = plt.subplots(figsize=(9, 4))
+    drawn = []
     for name in SERVER_NAMES:
-        if len(time_series[name]) > 1:
-            ax.step(time_series[name], val_series[name],
-                    label=name, color=COLORS[name], where="post", linewidth=1.8)
-    ax.set_title("Cumulative requests assigned per backend\n"
-                 "(each step = one new flow routed to that server)")
+        if len(ts[name]) > 1:
+            ax.step(ts[name], vs[name], color=COLORS[name], linewidth=1.5,
+                    alpha=0.75, where="post",
+                    label=name if _num_servers <= _LEGEND_THRESHOLD else "_")
+            drawn.append(name)
+    ax.set_title("Cumulative requests assigned per backend")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Total selections")
-    ax.legend(fontsize=9)
+    _add_server_legend(ax, drawn)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     _save(fig, out_dir / "04_cumulative_selections.png")
 
 
-def plot_queue_depth(selects, flow_removed, out_dir):
-    """Request queue depth per backend over time.
-
-    For round-robin queue_depth == active_conns (every dispatched request is
-    in-flight until its flow expires).  For least-connections with serialisation
-    they can differ.  Shown here for completeness and LC comparison.
-    """
-    ts = _events_to_step(selects, flow_removed, "queue_depth")
-    fig, ax = plt.subplots(figsize=(9, 4))
-    for name in SERVER_NAMES:
-        xs, ys = ts[name]
-        if len(xs) > 1:
-            ax.plot(xs, ys, label=name, color=COLORS[name], linewidth=1.8)
-    ax.set_title("Request queue depth per backend over time\n")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Queue depth")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-    fig.tight_layout()
-    _save(fig, out_dir / "07_queue_depth.png")
-
-
 def plot_score(snapshots, out_dir):
-    """Composite score over time — algorithm fitness function (lower = better)."""
     ts = ts_for(snapshots, "score")
     fig, ax = plt.subplots(figsize=(9, 4))
+    drawn = []
     for name in SERVER_NAMES:
         xs, ys = ts[name]
         if xs:
-            ax.plot(xs, ys, label=name, color=COLORS[name],
-                    marker=MARKERS[name], markersize=4, linewidth=1.8)
+            ax.plot(xs, ys, color=COLORS[name], markersize=3, linewidth=1.5,
+                    label=name if _num_servers <= _LEGEND_THRESHOLD else "_")
+            drawn.append(name)
     ax.set_title("Composite score per backend (lower = preferred)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Score")
-    ax.legend(fontsize=9)
+    _add_server_legend(ax, drawn)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     _save(fig, out_dir / "05_score.png")
 
 
 def plot_total_bytes(snapshots, out_dir):
-    """Cumulative bytes served — throughput fairness across backends."""
     ts = ts_for(snapshots, "total_bytes")
     fig, ax = plt.subplots(figsize=(9, 4))
+    drawn = []
     for name in SERVER_NAMES:
         xs, ys = ts[name]
         if xs:
-            ax.plot(xs, ys, label=name, color=COLORS[name],
-                    marker=MARKERS[name], markersize=4, linewidth=1.8)
+            ax.plot(xs, ys, color=COLORS[name], markersize=3, linewidth=1.5,
+                    label=name if _num_servers <= _LEGEND_THRESHOLD else "_")
+            drawn.append(name)
     ax.set_title("Cumulative bytes served per backend")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Bytes")
-    ax.legend(fontsize=9)
+    _add_server_legend(ax, drawn)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     _save(fig, out_dir / "06_total_bytes.png")
+
+
+def plot_queue_depth(selects, flow_removed, out_dir):
+    ts  = _events_to_step(selects, flow_removed, "queue_depth")
+    fig, ax = plt.subplots(figsize=(9, 4))
+    drawn = []
+    for name in SERVER_NAMES:
+        xs, ys = ts[name]
+        if len(xs) > 1:
+            ax.plot(xs, ys, color=COLORS[name], linewidth=1.5, alpha=0.75,
+                    label=name if _num_servers <= _LEGEND_THRESHOLD else "_")
+            drawn.append(name)
+    ax.set_title("Request queue depth per backend over time")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Queue depth")
+    _add_server_legend(ax, drawn)
+    ax.grid(True, alpha=0.3)
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    fig.tight_layout()
+    _save(fig, out_dir / "07_queue_depth.png")
+
+
+def plot_utilization(flow_removed, selects, out_dir):
+    """Server utilization: busy time vs idle time per backend.
+
+    busy_time  = sum of all completed flow durations for that server
+    experiment = wall-clock span from first to last event
+    idle_time  = experiment_duration - busy_time  (floor 0)
+
+    A bar chart shows busy vs idle stacked, giving an instant read on which
+    servers were actually used and how saturated they were.
+    An aggregate efficiency score is printed in the title:
+        efficiency = total_busy / (experiment_duration * num_servers)
+    """
+    all_events = selects + flow_removed
+    if not all_events:
+        return
+
+    t_start = min(e["t"] for e in all_events)
+    t_end   = max(e["t"] for e in all_events)
+    exp_dur = max(t_end - t_start, 1e-6)
+
+    busy = {n: 0.0 for n in SERVER_NAMES}
+    for ev in flow_removed:
+        name = ev.get("server")
+        dur  = ev.get("duration_s", 0.0)
+        if name in busy:
+            busy[name] += dur
+
+    total_busy  = sum(busy.values())
+    total_cap   = exp_dur * _num_servers
+    efficiency  = total_busy / total_cap if total_cap > 0 else 0
+
+    names      = SERVER_NAMES
+    busy_vals  = [busy[n] for n in names]
+    idle_vals  = [max(0, exp_dur - busy[n]) for n in names]
+
+    fig_w = max(7, min(30, 0.45 * len(names)))
+    fig, ax = plt.subplots(figsize=(fig_w, 4))
+
+    x = np.arange(len(names))
+    ax.bar(x, busy_vals, color="#4C72B0", alpha=0.85, label="Busy (flow duration sum)")
+    ax.bar(x, idle_vals, bottom=busy_vals, color="#CCCCCC", alpha=0.6, label="Idle")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=90 if len(names) > 10 else 0, fontsize=7)
+    ax.set_ylabel("Time (s)")
+    ax.set_xlabel("Backend")
+    ax.set_title(
+        f"Server utilization — busy vs idle time\n"
+        f"Overall efficiency: {efficiency*100:.1f}%  "
+        f"(total flow work / pool capacity)"
+    )
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save(fig, out_dir / "08_utilization.png")
 
 
 # ── main ──────────────────────────────────────────────────────────────────
@@ -398,9 +444,11 @@ def main():
     if selects or flow_removed:
         plot_queue_depth(selects, flow_removed, out_dir)
 
+    if flow_removed:
+        plot_utilization(flow_removed, selects, out_dir)
+
     print("\nDone.")
 
 
 if __name__ == "__main__":
     main()
-
