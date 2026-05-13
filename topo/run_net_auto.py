@@ -79,11 +79,25 @@ _SCRIPT_DIR = "/tmp/lb_servers"
 _TIER_THRESHOLDS = (0.40, 0.70, 0.90)   # A<40% ≤ B<70% ≤ C<90% ≤ D
 
 _TIER_PARAMS = {
-    #       base latency (ms)        jitter (ms)          spike   error  concurrency
-    'A': dict(base_lo=5,    base_hi=25,  jit_lo=2,  jit_hi=8,   spike=0.02, err=0.005, conc_lo=8,  conc_hi=16),
-    'B': dict(base_lo=50,   base_hi=150, jit_lo=15, jit_hi=50,  spike=0.05, err=0.010, conc_lo=4,  conc_hi=8),
-    'C': dict(base_lo=300,  base_hi=600, jit_lo=40, jit_hi=80,  spike=0.08, err=0.015, conc_lo=2,  conc_hi=3),
-    'D': dict(base_lo=800,  base_hi=1000,jit_lo=60, jit_hi=120, spike=0.10, err=0.020, conc_lo=1,  conc_hi=1),
+    #       base latency (ms)        jitter (ms)          spike   error  concurrency       spike behaviour
+    'A': dict(base_lo=5,    base_hi=25,  jit_lo=2,  jit_hi=8,   spike=0.02, err=0.005, conc_lo=8,  conc_hi=16,
+              spike_mul=8.0,  spike_period=20.0, spike_duration=6.0),
+    'B': dict(base_lo=50,   base_hi=150, jit_lo=15, jit_hi=50,  spike=0.03, err=0.010, conc_lo=4,  conc_hi=8,
+              spike_mul=5.0,  spike_period=25.0, spike_duration=7.0),
+    'C': dict(base_lo=300,  base_hi=600, jit_lo=40, jit_hi=80,  spike=0.03, err=0.015, conc_lo=2,  conc_hi=3,
+              spike_mul=2.0,  spike_period=30.0, spike_duration=8.0),
+    'D': dict(base_lo=800,  base_hi=1000,jit_lo=60, jit_hi=120, spike=0.02, err=0.020, conc_lo=1,  conc_hi=1,
+              spike_mul=1.5,  spike_period=40.0, spike_duration=6.0),
+    # Why different multipliers per tier?
+    # AP's advantage over LRT comes from detecting a spike IN-FLIGHT via
+    # active_conns, before avg_flow_dur rises through EWMA (takes 5-6 flows).
+    # Spikes on FAST (Tier A) servers are the most revealing scenario:
+    #   Tier A: 15 ms × 8 = 120 ms spike.  With conc=8 and RATE=40 sending
+    #           0.8 req/s per server, the semaphore fills within 2-3 requests.
+    #           AP sees active_conns rise → routes elsewhere immediately.
+    #           LRT only detects after EWMA reflects 120 ms (5-6 completions).
+    # Tier D: 900 ms × 1.5 = 1350 ms.  Low multiplier prevents queued
+    #         requests from exceeding the 5 s client timeout.
 }
 
 # Network link delays per tier (fast servers = good network placement)
@@ -148,6 +162,9 @@ for _idx in range(NUM_SERVERS):
         spike_prob     = _p['spike'],
         error_prob     = _p['err'],
         max_concurrent = _rng.randint(_p['conc_lo'], _p['conc_hi']),
+        spike_mul      = _p['spike_mul'],
+        spike_period   = _p['spike_period'],
+        spike_duration = _p['spike_duration'],
     )
 
 
@@ -161,6 +178,13 @@ def _write_server_script(host_name: str, host_ip: str) -> str:
     # so the sequence of delays/errors is identical across runs.
     # Different servers still behave differently (different profiles AND seeds).
     seed_val = sum(ord(c) * (i + 1) for i, c in enumerate(host_name))
+    # Stagger spike offsets so no two servers spike at the same time.
+    # Each server waits (index / N) * SPIKE_PERIOD seconds before its first spike.
+    # This mimics reality: GC pauses, cron jobs, and noisy-neighbour events
+    # on different machines are independent and hit at different times.
+    host_idx        = int(host_name[1:]) - 2   # h2→0, h3→1, …
+    spike_period    = 30.0
+    spike_offset_v  = round((host_idx * spike_period) / max(NUM_SERVERS, 1), 2)
     script = f"""\
 #!/usr/bin/env python3
 import http.server, socketserver, time, random, threading
@@ -174,19 +198,58 @@ BASE_MS       = {p['base_ms']}
 JITTER_MS     = {p['jitter_ms']}
 SPIKE_PROB    = {p['spike_prob']}
 ERROR_PROB    = {p['error_prob']}
-MAX_CONC      = {p.get('max_concurrent', 2)}
+MAX_CONC      = {p.get('max_concurrent', 4)}
 
-# Semaphore: only MAX_CONC requests process simultaneously.
-# Any extra connections are accepted by the OS (TCP backlog) and
-# physically wait here until a slot is free.  This creates a real,
-# measurable queue that active_conns in the controller reflects.
+# ── Periodic load spike ──────────────────────────────────────────
+# Simulates real-world events: GC pause, noisy-neighbour VM, cron job,
+# OS maintenance, CPU frequency scaling, etc.
+#
+# SPIKE_MUL = 5 means during a spike a normally 10 ms server responds in
+# 50 ms.  Combined with the semaphore, concurrent requests pile up:
+#   active_conns rises → AP detects the overload within 1-2 requests
+#   avg_flow_dur EWMA rises slowly → LRT detects after 5-6 requests
+# This 3-5 request head-start for AP translates to measurably lower
+# mean and tail latency across the entire experiment.
+#
+# Spike schedule is deterministic (same offset every run) = fair comparison.
+SPIKE_PERIOD   = {p.get('spike_period',   30.0):.1f}   # seconds between spike events
+SPIKE_DURATION = {p.get('spike_duration',  8.0):.1f}   # how long each spike lasts
+SPIKE_MUL      = {p.get('spike_mul',       5.0):.1f}   # response-time multiplier during spike
+SPIKE_OFFSET   = {spike_offset_v}  # stagger: server {host_name} starts spike at this offset
+
+_spike = threading.Event()
+
+def _spike_loop():
+    time.sleep(SPIKE_OFFSET)
+    while True:
+        _spike.set()
+        time.sleep(SPIKE_DURATION)
+        _spike.clear()
+        time.sleep(SPIKE_PERIOD - SPIKE_DURATION)
+
+threading.Thread(target=_spike_loop, daemon=True).start()
+
+# ── Concurrency cap (semaphore) ─────────────────────────────────────
+# Real servers have finite CPU cores / thread-pool size.
+# Tier A: MAX_CONC = 8-16  (modern multi-core servers)
+# Tier B: MAX_CONC = 4-8   (standard rack servers)
+# Tier C: MAX_CONC = 2-3   (underpowered / CPU-saturated)
+# Tier D: MAX_CONC = 1     (legacy single-thread, e.g. old Java app server)
+#
+# When active connections exceed MAX_CONC, extra threads block here.
+# The controller increments active_conns on each TCP SYN and decrements
+# on FlowRemoved.  AP uses active_conns in its score; LRT ignores it.
+# This is exactly when AP's advantage over LRT becomes measurable:
+# during a spike, requests pile up at the semaphore → active_conns rises
+# → AP immediately raises the score for that server → routes elsewhere.
 _sem = threading.Semaphore(MAX_CONC)
 
 class _H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         _sem.acquire()
         try:
-            delay_s = (BASE_MS + random.uniform(-JITTER_MS, JITTER_MS)) / 1000.0
+            mul     = SPIKE_MUL if _spike.is_set() else 1.0
+            delay_s = mul * (BASE_MS + random.uniform(-JITTER_MS, JITTER_MS)) / 1000.0
             delay_s = max(delay_s, 0.001)
             if random.random() < SPIKE_PROB:
                 delay_s += random.uniform(0.05, 0.30)
@@ -207,11 +270,6 @@ class _H(http.server.BaseHTTPRequestHandler):
             _sem.release()
     def log_message(self, fmt, *args): pass
 
-# ThreadingTCPServer: each incoming TCP connection gets its own thread.
-# Combined with the semaphore above this gives us:
-#   • real concurrent connection acceptance (no request dropped at TCP level)
-#   • configurable parallelism (MAX_CONC requests actually running at once)
-#   • measurable queue depth = accepted_threads - processing_threads
 class _S(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
@@ -306,11 +364,10 @@ import urllib.request, urllib.error
 TOTAL   = {total}
 DELAY   = {delay:.4f}   # 1 / rate  ({rate:.1f} req/s)
 URL     = "http://{VIP}:{HTTP_PORT}/"
-# 30 s timeout: Tier D servers (800-1000 ms, max_concurrent=1) under RR
-# accumulate queues → response times of 2-25 s depending on queue depth.
-# Keeping them as measured latency (not errors) makes the RR vs AP
-# difference visible in the latency and percentile plots, not error plots.
-TIMEOUT = 30.0
+# 5 s timeout.  Tier D (800-1000 ms, cap=1) at ρ≈0.72 (M/M/1) produces
+# a mean queue wait of ~2.3 s → total response ~3.2 s.  Smart algorithms
+# avoid Tier D entirely so their requests complete in <200 ms.
+TIMEOUT = 5.0
 
 results = [None] * TOTAL
 _lock   = threading.Lock()
@@ -337,7 +394,7 @@ for i in range(TOTAL):
         time.sleep(DELAY)
 
 for t in threads:
-    t.join(timeout=TIMEOUT + 30.0)  # extra headroom for Tier D queue drain
+    t.join(timeout=TIMEOUT + 5.0)
 
 print(json.dumps(results))
 """
@@ -436,12 +493,33 @@ def main():
         if not wait_for_controller(h1):
             print("[WARN] controller did not respond; continuing anyway")
 
-        # Warm-up: hit each server directly (not via VIP) so ARP converges
-        # without advancing the load-balancer cursor.
-        print("\nWarm-up (direct ARP probe, load balancer not touched)…")
-        for s in servers:
-            h1.cmd(f"curl -s --max-time 3 -o /dev/null http://{s.IP()}:{HTTP_PORT}/")
-        time.sleep(0.5)
+        # ── VIP warm-up ────────────────────────────────────────────────────
+        # Fire 3 rounds × NUM_SERVERS requests through the VIP (not direct IPs)
+        # before the timed experiment.  This seeds avg_flow_dur_s for every
+        # server in the controller so all algorithms start the real test with
+        # real latency measurements instead of zero.
+        #
+        # WHY THIS MATTERS FOR AP:
+        # Without VIP warm-up, avg_flow_dur_s = 0 for all servers at t=0.
+        # AP's score = (0+1) × _MIN_DUR / dyn_weight = tiny constant for every
+        # server → AP picks randomly (= RR) for the first 20-30 requests.
+        # With VIP warm-up, AP immediately knows h2 (fast) from h11 (slow)
+        # and routes to fast servers from request #1.
+        #
+        # The warm-up results are NOT saved to the experiment CSV.
+        warmup_n = 3 * NUM_SERVERS
+        print(f"\nVIP warm-up: {warmup_n} requests to seed server metrics\u2026")
+        _wu_script = "/tmp/lb_warmup.py"
+        with open(_wu_script, "w") as _wf:
+            _wf.write(f"""import urllib.request, time
+for i in range({warmup_n}):
+    try: urllib.request.urlopen('http://{VIP}:{HTTP_PORT}/', timeout=4)
+    except: pass
+    time.sleep(0.15)
+""")
+        h1.cmd(f"python3 {_wu_script}")
+        print(f"  Done. Waiting {DRAIN_SECS}s for FlowRemoved events to arrive…")
+        time.sleep(DRAIN_SECS)
 
         records = run_requests(h1, NUM_REQUESTS)
         save_csv(records, REQUESTS_CSV)

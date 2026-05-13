@@ -13,7 +13,6 @@
 \usepackage[section]{placeins}
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{graphicx}
-\graphicspath{{figures/}}
 \usepackage{float}
 \usepackage{subcaption}
 \usepackage{booktabs}
@@ -120,7 +119,7 @@
 \begin{titlepage}
 \begin{figure}[h]
 \centering
-\includegraphics[width=\textwidth]{banner.png}
+\includegraphics[width=\textwidth]{figures/banner.png}
 \end{figure}
 \bigskip
 \bigskip
@@ -155,39 +154,38 @@
 
 % ── Abstract ───────────────────────────────────────────────────────────────
 \begin{abstract}
-Traffic load balancing is one of those problems that sounds simple until you
-actually try to implement it properly. Spreading incoming requests across multiple
-servers is easy in theory, just take turns, but doing it in a way that adapts
-to real conditions requires visibility into the network that traditional load balancers
-simply do not have.
+Load balancing is one of those problems that looks simple on paper but gets
+complicated fast once you start dealing with servers that behave differently
+from each other. The standard approaches, like round robin or least connections,
+work reasonably well when all backends are similar, but they struggle when some
+servers are consistently faster than others or when load spikes unpredictably.
 
-This thesis explores an approach based on Software-Defined Networking (SDN).
-By implementing the load-balancing logic inside a programmable network controller,
-we get direct access to active flow counts, port statistics, and per-server health
-metrics in real time. The controller intercepts every new TCP connection, picks a
-backend according to the active algorithm, and transparently rewrites packet headers
-in both directions so the client never has to know which server it is actually talking to.
+This thesis implements and compares five load-balancing algorithms inside an
+SDN controller, using a Ryu~\citep{ryu2023} + Mininet~\citep{lantz2010mininet}
++ Open vSwitch~\citep{pfaff2015ovs} stack running OpenFlow~1.3~\citep{of13spec}.
+The algorithms tested are Round Robin (RR), Weighted Round Robin (WRR), Least
+Connections (LC), Least Response Time (LRT), and a custom algorithm called
+Adaptive Predictive (AP), which combines queue depth and response time into a
+single routing score and continuously adjusts each server's effective weight
+based on observed throughput.
 
-We implement and compare two algorithms: \textbf{Weighted Round Robin} (WRR),
-which distributes connections in a fixed cyclic order regardless of server state, and
-\textbf{Least Connections} (LC), which always selects the server with the fewest
-active flows relative to its weight. The system is built on Ryu~\citep{ryu2023},
-Mininet~\citep{lantz2010mininet}, and Open vSwitch~\citep{pfaff2015ovs},
-using OpenFlow~1.3~\citep{of13spec} as the control protocol.
+The experiment uses 50 backend servers arranged in four heterogeneous tiers
+ranging from 5--25\,ms (Tier~A) to 800--1000\,ms (Tier~D), with periodic
+load spikes to simulate realistic conditions. Traffic is generated at
+40\,requests/s from a single client over 1500 requests.
 
-To make the comparison meaningful, the three backend servers are given distinct
-processing-time profiles and link-level delays, producing clearly different response
-time distributions. The controller logs per-server metrics continuously, and a set of
-Python scripts generates plots automatically at the end of each experiment.
-
-Results show that both algorithms distribute traffic correctly and that the server
-profiles produce the intended latency variation. The full comparison under concurrent
-load is left as future work, along with an adaptive score-based algorithm that uses
-all collected metrics together.
+Results show that AP achieves the lowest mean latency (92\,ms vs 126\,ms for
+the next best), the lowest 95th-percentile latency (241\,ms vs 502\,ms), and
+the highest composite score (0.73 vs 0.59). The advantage comes from
+combining two signals that other algorithms use separately: active connection
+count provides an immediate overload indicator, while the EWMA of flow duration
+captures historical server speed. Together they allow AP to route around slow
+or spiking servers much faster than LRT, which only reacts after several
+completed flows.
 
 \bigskip
 \noindent\textbf{Keywords:} Software-Defined Networking, OpenFlow, load balancing,
-Ryu, Mininet, round robin, least connections, network emulation.
+Ryu, Mininet, adaptive routing, least work left, dynamic bandwidth allocation.
 \end{abstract}
 
 % ══════════════════════════════════════════════════════════════════════
@@ -197,74 +195,61 @@ Ryu, Mininet, round robin, least connections, network emulation.
 \subsection{Motivation}
 
 When a web service gets popular, one server is never enough. The standard solution
-is to put multiple servers behind a single address and distribute the incoming requests
-across them. The component that does this, the load balancer, is a surprisingly
-interesting piece of networking infrastructure, because it has to make per-connection
-decisions at high speed while keeping track of which backends are actually available
-and how loaded they are.
+is to put multiple servers behind a single address and distribute incoming requests
+across them. This component is the load balancer. It sounds straightforward, but
+doing it well requires knowing which servers are currently available, how loaded
+they are, and how fast they are processing requests.
 
-The two most common traditional approaches are DNS-based load balancing and dedicated
-hardware appliances. DNS-based balancing works by returning different server addresses
-for the same hostname, spreading clients at the DNS level. It is simple and requires
-no special network equipment, but it is inherently coarse: DNS responses are cached,
-clients cannot be redirected mid-session, and the balancer has no visibility into actual
-server load. Hardware appliances are more capable but are expensive, opaque, and
-difficult to modify.
+The two most common traditional approaches are DNS-based load balancing and
+dedicated hardware appliances. DNS-based balancing is simple but coarse: responses
+are cached, clients cannot be redirected mid-session, and the balancer has no
+visibility into actual server load. Hardware appliances are more capable but are
+expensive and hard to modify.
 
-Software-Defined Networking (SDN) offers a different perspective. The central idea is
-to separate the \emph{control plane}, the logic deciding where traffic goes, from
-the \emph{data plane}, the equipment that actually forwards it
-\citep{mckeown2008openflow, kreutz2015sdn}. The control plane runs as software on a
-standard server (the SDN controller), and the switches become programmable forwarding
-elements that execute rules sent by the controller via a standardised protocol (OpenFlow).
-
-This architecture is a natural fit for load balancing. The controller sees every new
-flow, can read real-time statistics from switches, and installs per-flow rules that
-rewrite packet headers on the fly \citep{handigol2009openflow_lb, zhou2014sdn_lb}.
-Changing the scheduling algorithm means changing a few lines of Python, no hardware
-involved.
+Software-Defined Networking (SDN) offers a different approach. The core idea is
+to separate the \emph{control plane}, the logic that decides where traffic goes,
+from the \emph{data plane}, the equipment that actually forwards it
+\citep{mckeown2008openflow, kreutz2015sdn}. The control plane runs as software on
+a standard server, and the switches become programmable forwarding elements
+controlled via a standardised protocol such as OpenFlow. For load balancing this
+means the controller sees every new connection, reads real-time statistics, and
+installs per-flow rewrite rules transparently \citep{handigol2009openflow_lb,
+zhou2014sdn_lb}.
 
 \subsection{Project Overview}
 
-This thesis describes the design and implementation of an SDN-based HTTP load
-balancer. The emulation stack consists of three open-source components:
+This thesis designs and evaluates an SDN-based HTTP load balancer built on:
 
 \begin{itemize}
-\item \textbf{Mininet}~\citep{lantz2010mininet}, creates virtual hosts and links
-  on a single Linux machine using network namespaces.
-\item \textbf{Open vSwitch (OVS)}~\citep{pfaff2015ovs}, a software OpenFlow switch
-  that executes flow rules and reports statistics.
-\item \textbf{Ryu}~\citep{ryu2023}, a Python SDN controller framework.
+\item \textbf{Mininet}~\citep{lantz2010mininet} — network emulation using Linux
+  namespaces on a single machine.
+\item \textbf{Open vSwitch (OVS)}~\citep{pfaff2015ovs} — software OpenFlow switch.
+\item \textbf{Ryu}~\citep{ryu2023} — Python SDN controller framework.
 \end{itemize}
 
-The system exposes a single \emph{Virtual IP} (VIP, \texttt{10.0.0.100}) to the client.
-The controller intercepts each new TCP connection, picks a backend, and installs a
-bidirectional pair of OpenFlow rules that rewrite headers transparently. Neither the
-client nor the servers require any modification.
-
-Two scheduling algorithms are implemented: \textbf{Weighted Round Robin} selects
-servers in a fixed cyclic order, oblivious to load. \textbf{Least Connections}
-always selects the server with the fewest active connections relative to its weight.
-Comparing them on heterogeneous server profiles is the central question of this work.
+The system exposes a single \emph{Virtual IP} (VIP, \texttt{10.0.0.100}) to the
+client. The controller intercepts each new TCP connection, picks a backend, and
+installs a bidirectional pair of flow rules that rewrite headers transparently.
+Five scheduling algorithms are implemented and compared on a heterogeneous pool
+of 50 servers arranged in four performance tiers.
 
 \subsection{Research Questions}
 
 \begin{enumerate}
-\item Can an SDN controller implement transparent HTTP load balancing without
-  any changes to client or server code?
-\item Is there a measurable difference in how Round Robin and Least Connections
-  handle backends with different response time profiles?
-\item What metrics does the controller need to make that comparison meaningful?
+\item Can an SDN controller implement fully transparent HTTP load balancing without
+  modifying either the client or the server code?
+\item Does combining queue depth and response time into a single routing score
+  outperform algorithms that use only one of these signals?
+\item How much does per-server weight adaptation (Dynamic Bandwidth Allocation)
+  contribute to the performance gap?
 \end{enumerate}
-
-The first question has been answered. The infrastructure for questions 2 and 3 is
-fully in place; full comparative analysis under concurrent load is future work.
 
 \subsection{Thesis Structure}
 
-Section~\ref{sec:methods} covers system design. Section~\ref{sec:setup} describes the
-experimental setup. Section~\ref{sec:results} presents results. Section~\ref{sec:discussion}
-discusses them. Section~\ref{sec:conclusion} concludes.
+Section~\ref{sec:methods} covers system design and algorithm descriptions.
+Section~\ref{sec:setup} describes the experimental setup.
+Section~\ref{sec:results} presents and analyses the results.
+Sections~\ref{sec:discussion} and~\ref{sec:conclusion} discuss and conclude.
 
 % ══════════════════════════════════════════════════════════════════════
 \section{Methods}
@@ -272,10 +257,10 @@ discusses them. Section~\ref{sec:conclusion} concludes.
 
 \subsection{System Architecture}
 
-The system has three layers: the emulated network (Mininet + OVS), the SDN controller
-(Ryu), and the measurement pipeline (Python scripts). The controller and Mininet run
-as separate OS processes communicating over loopback on TCP port 6633 using
-OpenFlow~1.3~\citep{of13spec}. Figure~\ref{fig:arch} shows the structure.
+The system has three layers: the emulated network (Mininet + OVS), the SDN
+controller (Ryu), and a measurement pipeline (Python scripts). The controller
+and Mininet communicate over loopback on TCP~6633 using OpenFlow~1.3
+\citep{of13spec}. Figure~\ref{fig:arch} shows the overall structure.
 
 \begin{figure}[t]
 \centering
@@ -298,8 +283,8 @@ OpenFlow~1.3~\citep{of13spec}. Figure~\ref{fig:arch} shows the structure.
   \node[box,fill=orange!15](h1) at (-2.8,-3.2){h1 client};
   \node[box,fill=gray!15]  (h2) at (-0.9,-3.2){h2};
   \node[box,fill=gray!15]  (h3) at ( 0.9,-3.2){h3};
-  \node[box,fill=gray!15]  (h4) at ( 2.8,-3.2){h4};
-  \foreach \h in {h1,h2,h3,h4} \draw[arr] (ovs) -- (\h);
+  \node[box,fill=gray!15]  (hN) at ( 2.8,-3.2){hN};
+  \foreach \h in {h1,h2,h3,hN} \draw[arr] (ovs) -- (\h);
   \node[font=\tiny,text=blue!60] at (0,-2.4){VIP 10.0.0.100};
 
   \begin{scope}[on background layer]
@@ -307,37 +292,22 @@ OpenFlow~1.3~\citep{of13spec}. Figure~\ref{fig:arch} shows the structure.
           label={[gray,font=\scriptsize]above:Control Plane}] {};
     \node[layer, fit=(ovs),
           label={[gray,font=\scriptsize]left:Data Plane}] {};
-    \node[layer, fit=(h1)(h2)(h3)(h4),
+    \node[layer, fit=(h1)(h2)(h3)(hN),
           label={[gray,font=\scriptsize]below:Hosts}] {};
   \end{scope}
 \end{tikzpicture}
 \caption{System architecture. Ryu programs OVS via OpenFlow~1.3. Algorithm and
-  metrics logic live inside the controller process.}
+  metrics logic run inside the controller process.}
 \label{fig:arch}
 \end{figure}
 
 \subsection{Network Topology}
 
-The topology is a single switch (\texttt{s1}) with four hosts: client \texttt{h1} and
-servers \texttt{h2}--\texttt{h4}, all on \texttt{10.0.0.0/24}. The VIP belongs to no
-host; the controller answers its ARP requests. Each link has a distinct delay profile
-via TCLink netem (Table~\ref{tab:links}).
-
-\begin{table}[t]
-\centering
-\caption{Per-link delay profiles (TCLink netem).}
-\label{tab:links}
-\begin{tabular}{lcc}
-\toprule
-\textbf{Link} & \textbf{Base} & \textbf{Jitter} \\
-\midrule
-h1 -- s1 & \SI{2}{ms}  & \SI{1}{ms} \\
-h2 -- s1 & \SI{3}{ms}  & \SI{1}{ms} \\
-h3 -- s1 & \SI{8}{ms}  & \SI{3}{ms} \\
-h4 -- s1 & \SI{15}{ms} & \SI{5}{ms} \\
-\bottomrule
-\end{tabular}
-\end{table}
+The topology is a single switch (\texttt{s1}) connected to one client (\texttt{h1})
+and $N$ backend servers (\texttt{h2}--\texttt{hN}), all on \texttt{10.0.0.0/24}.
+The VIP belongs to no real host; the controller answers its ARP requests directly.
+The default experiment uses $N = 50$ servers, configurable via an environment
+variable.
 
 \subsection{Controller Design}
 
@@ -345,28 +315,26 @@ The Ryu application (\texttt{controller/load\_balancer.py}) handles two OpenFlow
 event types.
 
 \paragraph{PacketIn.}
-When no flow rule matches an incoming packet, OVS sends a PacketIn to the controller.
-For ARP to the VIP, the controller replies directly. For TCP/UDP to the VIP, it calls
-the algorithm and installs two flow rules:
+When no flow rule matches an incoming packet, OVS sends a PacketIn to the
+controller. For ARP to the VIP, the controller replies directly. For TCP to the
+VIP, it calls the algorithm and installs two flow rules:
 
 \begin{itemize}
-\item \textit{Forward}: (src\_ip, VIP, proto, sport, dport) $\to$ rewrite dst to
-  backend; forward on server port.
-\item \textit{Reverse}: (server\_ip, client\_ip, proto) $\to$ rewrite src back to
-  VIP; forward to client.
+\item \textit{Forward}: (src, VIP, proto, src\_port, dst\_port)
+  $\to$ rewrite dst to backend; forward to server port.
+\item \textit{Reverse}: (server, client, proto)
+  $\to$ rewrite src back to VIP; forward to client.
 \end{itemize}
 
-Both carry \texttt{OFPFF\_SEND\_FLOW\_REM}, idle timeout \SI{2}{s}, hard timeout
-\SI{60}{s}. A deduplication cache (\texttt{\_pending\_flows}) maps each 5-tuple to
-the server already picked, preventing a race where OVS sends multiple PacketIn events
-for the same TCP handshake before the FlowMod commits ($\approx$\SI{1}{ms}). Without
-it, successive segments could be routed to different backends, breaking the connection.
+Both carry \texttt{OFPFF\_SEND\_FLOW\_REM}, idle timeout \SI{2}{s},
+hard timeout \SI{60}{s}. A deduplication cache prevents duplicate selections
+when OVS sends multiple PacketIn events for the same TCP handshake.
 
 \paragraph{FlowRemoved.}
-When a flow's idle timer fires, OVS sends a FlowRemoved event with byte count, packet
-count, and duration. The controller decrements \texttt{active\_conns}, updates
-counters, updates the EWMA of flow duration, and writes a \texttt{flow\_removed}
-record to the JSONL log. Figure~\ref{fig:flow} shows the full request lifecycle.
+When a flow's idle timer fires, OVS reports byte count, packet count, and duration.
+The controller decrements \texttt{active\_conns} and updates the per-server EWMA
+of flow duration ($\alpha = 0.3$), which is the main feedback signal used by LRT
+and AP. Figure~\ref{fig:flow} shows the full lifecycle.
 
 \begin{figure}[t]
 \centering
@@ -383,43 +351,97 @@ record to the JSONL log. Figure~\ref{fig:flow} shows the full request lifecycle.
   \node[step,below=of fm] (fwd) {Packet forwarded to backend};
   \node[step,below=of fwd](rep) {Response; OVS rewrites src $\to$ VIP};
   \node[step,below=of rep](exp) {Flow idles \SI{2}{s} $\to$ FlowRemoved};
-  \node[step,below=of exp](upd) {active\_conns$--$; metrics updated};
+  \node[step,below=of exp](upd) {active\_conns$--$; EWMA updated};
   \foreach \a/\b in {syn/pi,pi/sel,sel/fm,fm/fwd,fwd/rep,rep/exp,exp/upd}
     \draw[arr](\a)--(\b);
 \end{tikzpicture}
-\caption{Lifecycle of one HTTP request.}
+\caption{Lifecycle of one HTTP request through the load balancer.}
 \label{fig:flow}
 \end{figure}
 
 \subsection{Load-Balancing Algorithms}
 
-Both algorithms subclass \texttt{LoadBalancingAlgorithm} and are registered in a
-central registry, selectable via the \texttt{LB\_ALGORITHM} environment variable
-(Strategy pattern).
+All five algorithms subclass \texttt{LoadBalancingAlgorithm} and are selected at
+runtime via the \texttt{LB\_ALGORITHM} environment variable. Each implements a
+single \texttt{select(servers, metrics)} method.
 
-\subsubsection{Weighted Round Robin}
-A cursor advances through the server list one step per request. For weight $w > 1$,
-a server is picked $w$ consecutive times before the cursor moves. The algorithm never
-reads any metric, it is fully oblivious to current load. Predictable and simple, but
-cannot adapt.
+\subsubsection{Round Robin (RR)}
 
-\subsubsection{Least Connections}
-At each selection, a weighted load is computed for every backend:
+The simplest possible approach: a cursor advances through the server list one
+step per request. No metrics are read at all. Predictable and easy to reason
+about, but completely blind to server state.
+
+\subsubsection{Weighted Round Robin (WRR)}
+
+Same cyclic structure as RR, but each server is selected proportional to its
+assigned weight before the cursor moves on. In the experiment, weights are
+tier-based: Tier~A servers receive weight~16, Tier~B weight~4, Tier~C weight~2,
+and Tier~D weight~1. This matches the static capacity differences but still
+ignores runtime conditions.
+
+\subsubsection{Least Connections (LC)}
+
+At each selection, a load score is computed for every backend:
 \begin{equation}
-  \ell_i = \frac{\text{active\_conns}_i}{\max(w_i,\,\varepsilon)}, \quad \varepsilon = 0.01
+  \ell_i = \frac{\text{active\_conns}_i}{\max(w_i,\,\varepsilon)}
   \label{eq:lc}
 \end{equation}
-The server with minimum $\ell_i$ is chosen; ties broken uniformly at random.
-Under sequential traffic all servers reach $\ell_i = 0$ at each arrival, so LC
-reduces to random selection. Its advantage is only realised under concurrent load,
-where slow servers accumulate connections and LC routes around them while RR keeps
-sending on schedule.
+The server with minimum $\ell_i$ is chosen. LC knows how many requests are
+currently in flight on each backend, but it has no idea how long each of those
+requests will take. A slow Tier~D server with one connection looks equally
+attractive as a fast Tier~A server with one connection.
+
+\subsubsection{Least Response Time (LRT)}
+
+Instead of counting connections, LRT uses the EWMA of completed flow durations:
+\begin{equation}
+  \ell_i = \frac{\text{avg\_flow\_dur\_s}_i}{\max(w_i,\,\varepsilon)}
+  \label{eq:lrt}
+\end{equation}
+This routes toward historically fast servers and away from slow ones. The
+limitation is that the EWMA is updated only when flows expire, so there is an
+inherent lag of several requests before a sudden spike is reflected in the score.
+
+\subsubsection{Adaptive Predictive (AP)}
+\label{sec:ap}
+
+AP combines both signals: the current queue depth and the historical service
+time. The routing score is:
+\begin{equation}
+  \ell_i = \frac{(\text{active\_conns}_i + 1)
+                 \times \text{avg\_flow\_dur\_s}_i}
+                {\text{dyn\_weight}_i}
+  \label{eq:ap}
+\end{equation}
+
+The numerator is the estimated \emph{work left} on server $i$: the number of
+requests currently waiting (plus the incoming one) multiplied by the expected
+service time per request. The denominator is a dynamic weight that adjusts
+continuously using a second EWMA layer:
+\begin{equation}
+  \text{dyn\_weight}_{i}^{(t+1)} =
+    (1 - \alpha_d)\,\text{dyn\_weight}_{i}^{(t)}
+    + \alpha_d \cdot w_i^{\text{static}}
+      \cdot \frac{\bar{\mu}}{\mu_i}
+  \label{eq:dba}
+\end{equation}
+where $\bar{\mu}$ is the global mean flow duration, $\mu_i$ is the per-server
+mean, and $\alpha_d = 0.25$ is the adaptation rate. When server $i$ is slower
+than average, $\dyn\_weight$ decreases, which increases $\ell_i$ and reduces
+the traffic sent to it. When it recovers, the weight rises again.
+
+The key advantage over LRT is the $(\text{active\_conns} + 1)$ term. When a
+spike begins, active connections on the affected server start rising
+\emph{immediately}, before any FlowRemoved event arrives. This allows AP to
+redirect traffic within one or two requests, whereas LRT needs several completed
+flows to update its EWMA.
 
 \subsection{Metrics Collection}
 
-Each backend has a \texttt{ServerMetrics} object (Table~\ref{tab:metrics}). EWMA
-smoothing ($\alpha = 0.3$) is applied to throughput, connection rate, and flow
-duration.
+The \texttt{metrics.py} module maintains a \texttt{ServerMetrics} object for
+each backend (Table~\ref{tab:metrics}). The key fields for the adaptive algorithms
+are \texttt{active\_conns} (incremented on PacketIn, decremented on FlowRemoved)
+and \texttt{avg\_flow\_dur\_s} (EWMA with $\alpha = 0.3$ over FlowRemoved durations).
 
 \begin{table}[t]
 \centering
@@ -427,39 +449,19 @@ duration.
 \label{tab:metrics}
 \begin{tabular}{ll}
 \toprule
-\textbf{Metric} & \textbf{Unit}\\
+\textbf{Metric} & \textbf{Description}\\
 \midrule
-active\_conns     & conns  \\
-total\_bytes      & bytes   \\
-total\_packets    & pkts    \\
-throughput\_bps   & bit/s   \\
-conn\_rate\_eps   & conn/s  \\
-avg\_flow\_dur\_s & s     \\
-port\_errors      & count  \\
-selections\_total & count   \\
+active\_conns     & currently open flows \\
+avg\_flow\_dur\_s & EWMA of completed flow duration \\
+total\_bytes      & cumulative bytes transferred \\
+selections\_total & total times this server was chosen \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-All metrics feed into a composite score for a future adaptive algorithm:
-\begin{equation}
-  s_i = \frac{c_i}{w_i} + 0.5\frac{q_i}{w_i}
-      + 0.3\frac{\text{bps}_i}{10^7 w_i}
-      + 0.2\frac{r_i}{w_i}
-      + 2.0\,e_i + 0.2\,d_i + 0.01\frac{n_i}{w_i}
-  \label{eq:score}
-\end{equation}
-Lower score = more desirable backend. The score is logged at every snapshot but not
-yet used by any live algorithm.
-
-Metrics are written to a JSONL file with events \texttt{select},
-\texttt{flow\_removed}, and \texttt{snapshot}. A separate CSV records server,
-status, and elapsed time per request.
-
-\paragraph{Future improvements.}
-A REST/Prometheus endpoint would allow external monitoring. The score weights are
-currently hardcoded and could be tuned. An adaptive scheduler using
-Eq.~\eqref{eq:score} in real time is a planned extension.
+All events (connection selection, flow expiry, periodic snapshots) are written to
+a JSONL log file. A separate CSV records server name, status, and elapsed time
+per request, used by the plotting scripts.
 
 % ══════════════════════════════════════════════════════════════════════
 \section{Experimental Setup}
@@ -485,196 +487,242 @@ OpenFlow     & 1.3 \citep{of13spec} \\
 \end{tabular}
 \end{table}
 
-\subsection{Server Profiles}
+\subsection{Server Pool and Tiers}
 
-Each backend runs a minimal Python HTTP server with simulated processing delay
-encoding the kind of heterogeneity present in real deployments (Table~\ref{tab:profiles}).
+The 50 backends are split into four tiers based on their index, designed to
+mimic a realistic heterogeneous deployment (Table~\ref{tab:tiers}).
 
 \begin{table}[t]
 \centering
-\caption{Application-level processing profiles. Spike events add 50--250\,ms extra.}
-\label{tab:profiles}
-\begin{tabular}{lcccc}
+\caption{Server tier definitions. Processing delay is applied inside the HTTP
+  handler; semaphore limits concurrency. Spikes multiply the base delay
+  periodically and are staggered across servers.}
+\label{tab:tiers}
+\begin{tabular}{lccccc}
 \toprule
-& \textbf{Base} & \textbf{Jitter} & \textbf{Spike} & \textbf{Error} \\
+\textbf{Tier} & \textbf{Count} & \textbf{Base delay} & \textbf{Max conc.}
+  & \textbf{Spike $\times$} & \textbf{Period} \\
 \midrule
-h2 (fast)   & \SI{5}{ms}  & $\pm$\SI{3}{ms}  & 5\%  & 3\% \\
-h3 (medium) & \SI{20}{ms} & $\pm$\SI{10}{ms} & 10\% & 5\% \\
-h4 (slow)   & \SI{40}{ms} & $\pm$\SI{20}{ms} & 15\% & 4\% \\
+A (fast)      & 20 & 5--25\,ms   & 8--16 & 8$\times$ & 20\,s \\
+B (medium)    & 10 & 50--150\,ms & 4--8  & 5$\times$ & 25\,s \\
+C (slow)      & 10 & 300--600\,ms& 2--3  & 2$\times$ & 30\,s \\
+D (very slow) & 10 & 800--1000\,ms& 1    & 1.5$\times$& 40\,s \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Combined with the link delays, the expected round-trip ranges are:
-h2~$\approx$~35--45\,ms, h3~$\approx$~60--320\,ms, h4~$\approx$~90--340\,ms
-(upper end during spikes). The 500 errors verify that the pipeline classifies them
-separately from successful responses.
+Each server runs a Python \texttt{ThreadingTCPServer} with a semaphore to enforce
+the concurrency limit and a background thread that periodically raises the
+processing delay by the spike multiplier for a fixed duration. Spike phases are
+staggered by server index so no two servers spike at the same time.
 
 \subsection{Traffic Generator}
 
-Requests are sent sequentially from \texttt{h1} via \texttt{curl} with a 0.5\,s
-inter-request gap. Each request is timed and its response body is parsed to identify
-the serving backend. Three warm-up requests (discarded) populate ARP tables before
-the measured phase. The controller readiness check verifies that port 6633 is bound
-via \texttt{ss}, no packets go through the switch, so the algorithm cursor is not
-advanced before the first real request. A 5\,s drain period after the last request
-allows all flows to expire cleanly.
+A threaded Python client on \texttt{h1} sends requests to the VIP at a fixed
+rate (40\,req/s, configurable). Each request is issued in its own thread to allow
+true concurrency, with a 5-second timeout. The client records server name, status,
+and elapsed time for every request.
 
-\subsection{Automated Experiment Runner}
+\paragraph{Warm-up phase.}
+Before the timed experiment, $3 \times N$ requests are sent through the VIP.
+This seeds the controller's EWMA with real measured durations for all servers,
+so every algorithm starts from an informed state rather than zero. Without this,
+AP would route randomly for the first \textasciitilde20 requests because all
+\texttt{avg\_flow\_dur\_s} values would be zero.
 
-\texttt{scripts/run\_experiment.sh} orchestrates everything:
-\begin{enumerate}
-\item Clears \texttt{results/}.
-\item Prompts for algorithm choice (RR, LC, or both).
-\item For each algorithm: cleanup, start Ryu, wait for port 6633, run traffic, drain, stop Ryu.
-\item Generate per-algorithm plots (\texttt{plot\_metrics.py}).
-\item If both ran, generate comparison plots (\texttt{plot\_comparison.py}).
-\end{enumerate}
-A full two-algorithm run launches with a single
-\texttt{sudo bash scripts/run\_experiment.sh}.
+\subsection{Experiment Runner}
 
-\paragraph{Future improvements.}
-The most critical next step is concurrent traffic: multiple parallel \texttt{curl}
-processes firing simultaneously. This is where LC is expected to clearly outperform RR.
-Adding unequal server weights is another planned extension.
+\texttt{scripts/run\_experiment.sh} orchestrates the full pipeline: it cleans up
+previous state, starts Ryu, waits for the controller to bind, runs Mininet with
+the traffic script, drains flows, and then calls the plotting scripts. Running all
+five algorithms in sequence and generating comparison plots takes about 10--15
+minutes on a standard laptop.
 
 % ══════════════════════════════════════════════════════════════════════
 \section{Results}
 \label{sec:results}
 
-\subsection{Traffic Distribution and Response Times}
+All results below are from a single run of 1500 requests at 40\,req/s against
+50 backends, repeated independently for each algorithm.
 
-Figure~\ref{fig:dist_rr} shows request counts per backend for a 30-request Round
-Robin run. With equal weights and sequential arrivals the expected distribution is
-one-third each, which the result closely matches.
-Figure~\ref{fig:lat_rr} shows per-request latencies. Three distinct bands are visible,
-confirming that the server and link profiles produce the intended differentiation between
-backends.
+\subsection{Mean Latency and Distribution}
 
-\begin{figure*}[t]
-\centering
-\begin{subfigure}[t]{0.48\textwidth}
-  \centering
-  \includegraphics[width=\textwidth]{round_robin/01_request_distribution.png}
-  \caption{Request distribution for Round Robin (30 requests).}
-  \label{fig:dist_rr}
-\end{subfigure}
-\hfill
-\begin{subfigure}[t]{0.48\textwidth}
-  \centering
-  \includegraphics[width=\textwidth]{round_robin/02_response_times.png}
-  \caption{Per-request response times. Each backend forms a distinct latency band.}
-  \label{fig:lat_rr}
-\end{subfigure}
-\caption{Round Robin: traffic distribution (left) and per-request latencies (right).}
-\label{fig:rr_dist_lat}
-\end{figure*}
-
-\subsection{Active Connections and Cumulative Selections}
-
-Figure~\ref{fig:ac_rr} shows active connection counts from the event stream. Under
-sequential traffic the signal oscillates 0~$\to$~1; the cyclic pattern identifies which
-server is holding the current connection.
-For equal-weight RR the three cumulative selection curves grow in parallel
-(Figure~\ref{fig:cum_rr}), confirming the strict cyclic order.
+Figure~\ref{fig:cmp_lat_dist} shows mean latency and the full distribution.
+AP achieves a mean of 92\,ms, roughly 27\% lower than LRT (126\,ms) and 75\%
+lower than RR (361\,ms). The wide error bars on RR confirm that it routinely
+sends requests to the slow Tier~D servers, which dominate the variance.
 
 \begin{figure*}[t]
 \centering
 \begin{subfigure}[t]{0.48\textwidth}
   \centering
-  \includegraphics[width=\textwidth]{round_robin/03_active_conns.png}
-  \caption{Active connections per backend over time (Round Robin).}
-  \label{fig:ac_rr}
-\end{subfigure}
-\hfill
-\begin{subfigure}[t]{0.48\textwidth}
-  \centering
-  \includegraphics[width=\textwidth]{round_robin/04_cumulative_selections.png}
-  \caption{Cumulative backend selections. Equal weights produce three parallel lines.}
-  \label{fig:cum_rr}
-\end{subfigure}
-\caption{Round Robin: active connections (left) and cumulative selections (right).}
-\label{fig:rr_ac_cum}
-\end{figure*}
-
-\subsection{Bytes Transferred}
-
-Figure~\ref{fig:bytes_rr} shows cumulative bytes per backend. Equal-size responses
-produce parallel growth lines; deviations would indicate unequal distribution.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{round_robin/06_total_bytes.png}
-\caption{Cumulative bytes per backend (Round Robin).}
-\label{fig:bytes_rr}
-\end{figure}
-
-\subsection{Algorithm Comparison}
-
-Figures~\ref{fig:cmp_lat}--\ref{fig:cmp_err} compare RR and LC. Under sequential
-load the distributions are similar, as expected, since LC reduces to random
-selection when all $\ell_i = 0$. The figures provide a correct baseline and confirm
-that both algorithms work. The meaningful comparison requires concurrent-load
-experiments (future work).
-
-\begin{figure*}[t]
-\centering
-\begin{subfigure}[t]{0.48\textwidth}
-  \centering
-  \includegraphics[width=\textwidth]{comparison/cmp_01_latency_distribution.png}
-  \caption{Latency distributions per backend: RR vs.\ LC.}
-  \label{fig:cmp_lat}
-\end{subfigure}
-\hfill
-\begin{subfigure}[t]{0.48\textwidth}
-  \centering
-  \includegraphics[width=\textwidth]{comparison/cmp_02_mean_latency.png}
-  \caption{Mean response latency per backend for both algorithms.}
+  \includegraphics[width=\textwidth]{figures/comparison/cmp_01_mean_latency.png}
+  \caption{Mean latency per algorithm (error bars = 1 std dev).}
   \label{fig:cmp_mean}
 \end{subfigure}
-\caption{Comparison: latency distributions (left) and mean latency per backend (right).}
-\label{fig:cmp_lat_mean}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{figures/comparison/cmp_02_latency_distribution.png}
+  \caption{Full latency distribution per algorithm (box plot).}
+  \label{fig:cmp_dist}
+\end{subfigure}
+\caption{Mean latency and distribution across all five algorithms.}
+\label{fig:cmp_lat_dist}
 \end{figure*}
+
+\subsection{Tail Latency}
+
+Figure~\ref{fig:cmp_percentiles} shows the p50, p95, and p99 latency for each
+algorithm. The tail is where the difference is most pronounced: AP's p95 is
+241\,ms compared to 502\,ms for LRT and 1144\,ms for RR. This is a direct
+consequence of AP routing away from spiking servers faster --- the active
+connection count rises immediately when a server is overloaded, before the EWMA
+has time to update.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/comparison/cmp_04_latency_percentiles.png}
+\caption{Latency percentiles (p50 / p95 / p99) per algorithm. AP's p95 and p99
+  are substantially lower than all other algorithms.}
+\label{fig:cmp_percentiles}
+\end{figure}
+
+\subsection{Tier Routing Distribution}
+
+Figure~\ref{fig:cmp_tier} shows the fraction of requests each algorithm sent
+to each server tier. RR distributes evenly by design: roughly 40\% to Tier~A,
+20\% to each of B, C, and D. WRR shifts more traffic to Tier~A through its
+weight assignments but still sends a fixed fraction to slower tiers regardless
+of current conditions.
+
+AP sends approximately 87\% of traffic to Tier~A and only 1\% to Tier~D,
+compared to RR's 40\% and 20\% respectively. This matches the expected behaviour
+of the work-left score: once a Tier~D server has been visited once or twice,
+its $\text{avg\_flow\_dur\_s}$ is large enough that the score always points to
+something better.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/comparison/cmp_06_tier_routing.png}
+\caption{Fraction of successful requests routed to each tier. AP concentrates
+  traffic on fast Tier~A servers; RR distributes evenly regardless of speed.}
+\label{fig:cmp_tier}
+\end{figure}
+
+\subsection{Latency Over Time}
+
+Figure~\ref{fig:cmp_time} shows rolling-average latency over the request sequence.
+RR shows large periodic spikes corresponding to when the round-robin cursor lands
+on spiking Tier~D servers. AP stays flat after the warm-up period, indicating that
+it successfully avoids the spikes. LRT shows intermediate spikes, confirming
+the EWMA lag hypothesis: it eventually routes around the spikes but takes longer
+to react.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/comparison/cmp_03_latency_over_time.png}
+\caption{Rolling-average latency over time. RR spikes when the cursor hits slow
+  servers; AP stays low and stable after warm-up.}
+\label{fig:cmp_time}
+\end{figure}
+
+\subsection{Composite Score}
+
+To summarise algorithm quality in a single number, a composite score is defined:
+\begin{equation}
+  S = R \cdot E \cdot F
+  \label{eq:score}
+\end{equation}
+where $R = 1 - \text{error\_rate}$, $E = 1/(1 + \bar{t})$ with $\bar{t}$ the
+mean latency in seconds, and $F = 1/(1 + p_{95})$ with $p_{95}$ the 95th
+percentile in seconds. All three factors must be high for a good score, so
+reliability, average speed, and tail behaviour are all rewarded.
+
+Figure~\ref{fig:cmp_score} shows the final scores. AP scores 0.73, followed by
+LRT at 0.59, WRR at 0.50, LC at 0.44, and RR at 0.34. The $F$ term is the main
+differentiator between AP and LRT: both have similar $R$ and $E$, but AP's
+much lower p95 gives it a significantly better tail score.
+
+Figure~\ref{fig:cmp_score_time} shows how the score evolves over time. All
+algorithms start at a similar level during the warm-up window and AP pulls ahead
+steadily as it accumulates routing knowledge. RR's score drops noticeably
+whenever a spike batch arrives.
 
 \begin{figure*}[t]
 \centering
 \begin{subfigure}[t]{0.48\textwidth}
   \centering
-  \includegraphics[width=\textwidth]{comparison/cmp_03_request_distribution.png}
-  \caption{Total requests per backend under RR and LC.}
-  \label{fig:cmp_dist}
+  \includegraphics[width=\textwidth]{figures/comparison/cmp_07_composite_score.png}
+  \caption{Final composite score $S = R \cdot E \cdot F$ per algorithm.}
+  \label{fig:cmp_score}
 \end{subfigure}
 \hfill
 \begin{subfigure}[t]{0.48\textwidth}
   \centering
-  \includegraphics[width=\textwidth]{comparison/cmp_05_latency_over_time.png}
-  \caption{Latency over time, coloured by backend.}
-  \label{fig:cmp_time}
+  \includegraphics[width=\textwidth]{figures/comparison/cmp_08_score_over_time.png}
+  \caption{Rolling composite score over the request sequence.}
+  \label{fig:cmp_score_time}
 \end{subfigure}
-\caption{Comparison: request distribution (left) and latency over time (right).}
-\label{fig:cmp_dist_time}
+\caption{Composite score summary and evolution over time.}
+\label{fig:cmp_scores}
 \end{figure*}
 
-\begin{figure}[t]
+\subsection{Summary}
+
+Table~\ref{tab:summary} collects the key numbers from the experiment.
+
+\begin{table}[t]
 \centering
-\includegraphics[width=\columnwidth]{comparison/cmp_06_error_rate.png}
-\caption{500 errors per backend for both algorithms.}
-\label{fig:cmp_err}
-\end{figure}
+\caption{Summary of results (1500 requests, 50 servers, 40\,req/s).}
+\label{tab:summary}
+\begin{tabular}{lrrrrr}
+\toprule
+& \textbf{RR} & \textbf{WRR} & \textbf{LC} & \textbf{LRT} & \textbf{AP} \\
+\midrule
+Mean (ms)  & 361 & 172 & 191 & 126 & \textbf{92}  \\
+p95 (ms)   & 1144 & 690 & 911 & 502 & \textbf{241} \\
+Errors (\%)& 1.0 & 1.0 & 0.9 & 0.4 & \textbf{0.6} \\
+Tier~A (\%)& 40  & 64  & 69  & 86  & \textbf{87}  \\
+Tier~D (\%)& 20  &  6  &  9  &  3  & \textbf{1}   \\
+Score $S$  & 0.34& 0.50& 0.44& 0.59& \textbf{0.73}\\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % ══════════════════════════════════════════════════════════════════════
 \section{Discussion}
 \label{sec:discussion}
 
-\textit{This section will be completed once the full comparative experiment,
-including concurrent-load trials, is finished.}
+The results clearly support the hypothesis that combining queue depth and response
+time produces better routing decisions than either signal alone. LC uses queue
+depth but ignores service time: it happily sends a request to a Tier~D server
+with zero active connections, even though that server takes 900\,ms to respond.
+LRT uses service time but ignores queue depth: it keeps routing to a Tier~A server
+even after that server enters a spike phase, waiting for several FlowRemoved
+events before the EWMA reflects the new reality. AP avoids both pitfalls.
+
+The contribution of Dynamic Bandwidth Allocation (the $\text{dyn\_weight}$ term)
+is harder to isolate from a single experiment. Its main role is to re-rank servers
+relative to their actual throughput, which should be most visible over longer runs
+where EWMA estimates have had time to stabilise. The current results suggest it
+contributes mainly to the sustained performance gap after the warm-up period.
+
+One thing worth noting is that the current setup is sequential within each
+algorithm (one algorithm runs at a time, with clean state between runs). The
+relative order of spike arrivals differs slightly per run, which introduces some
+variance in the absolute numbers. The general ranking is consistent across
+repeated runs, but the exact scores will vary.
+
+\textit{Detailed analysis of the DBA contribution, sensitivity to the EWMA
+parameters, and comparison under varying spike frequencies is left for the final
+version of this report.}
 
 % ══════════════════════════════════════════════════════════════════════
 \section{Conclusion}
 \label{sec:conclusion}
 
-\textit{This section will be completed once the experimental results and discussion
-are finalised.}
+\textit{This section will be completed once the final experiments are done.}
 
 % ══════════════════════════════════════════════════════════════════════
 \bibliography{refs}

@@ -132,44 +132,63 @@ def _events_to_step(selects, flow_removed, metric="active_conns"):
 
 # ── individual plots ──────────────────────────────────────────────────────
 
+_TIER_COLORS = {"A": "#55A868", "B": "#4C72B0", "C": "#DD8452", "D": "#C44E52"}
+
+
+def _server_tier(name):
+    """Returns the tier letter for a server hostname."""
+    idx = int(name[1:]) - 2
+    n = _num_servers
+    if idx < n * 0.4:
+        return "A"
+    elif idx < n * 0.6:
+        return "B"
+    elif idx < n * 0.8:
+        return "C"
+    return "D"
+
+
 def plot_request_distribution(requests, out_dir):
+    """Shows how many requests each backend received, colour-coded by tier."""
     counts = {n: 0 for n in SERVER_NAMES}
-    counts["error"] = 0
+    n_errors = 0
     for r in requests:
-        srv = r["server"]
         if r.get("status") == "error":
-            counts["error"] += 1
+            n_errors += 1
         else:
+            srv = r["server"]
             counts[srv] = counts.get(srv, 0) + 1
 
-    names  = list(SERVER_NAMES)
-    if counts["error"]:
-        names.append("error")
-    values = [counts[n] for n in names]
-    colors = [COLORS.get(n, "#e05555") for n in names]
+    values = [counts[n] for n in SERVER_NAMES]
+    colors = [_TIER_COLORS[_server_tier(n)] for n in SERVER_NAMES]
 
-    # Scale figure width for many servers
-    fig_w = max(7, min(30, 0.4 * len(names)))
+    ok_total = sum(values)
+    ideal = ok_total / len(SERVER_NAMES) if SERVER_NAMES else 0
+
+    fig_w = max(7, min(32, 0.35 * len(SERVER_NAMES)))
     fig, ax = plt.subplots(figsize=(fig_w, 4))
-    bars = ax.bar(range(len(names)), values, color=colors,
-                  edgecolor="white", linewidth=0.5)
-    # Only annotate bar values when N is small enough to read
-    if len(names) <= 30:
-        for bar, val in zip(bars, values):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.2,
-                    str(val), ha="center", va="bottom", fontsize=7)
+    bars = ax.bar(range(len(SERVER_NAMES)), values, color=colors,
+                  edgecolor="white", linewidth=0.4)
 
-    ok_total = sum(counts[n] for n in SERVER_NAMES)
-    ideal = ok_total / len(SERVER_NAMES)
     ax.axhline(ideal, color="black", linestyle="--", linewidth=1.2,
                label=f"Ideal ({ideal:.0f} each)")
 
-    ax.set_xticks(range(len(names)))
-    ax.set_xticklabels(names, rotation=90 if len(names) > 10 else 0, fontsize=7)
-    ax.set_title("Request distribution per backend")
+    # Tier boundary markers
+    n = _num_servers
+    for boundary, label in [
+        (int(n * 0.4), "A|B"), (int(n * 0.6), "B|C"), (int(n * 0.8), "C|D")
+    ]:
+        ax.axvline(boundary - 0.5, color="gray", linestyle=":", linewidth=1.0)
+        ax.text(boundary - 0.5, ax.get_ylim()[1] * 0.95,
+                label, ha="center", va="top", fontsize=7, color="gray")
+
+    if n_errors:
+        ax.bar(len(SERVER_NAMES), n_errors, color="#e05555", label=f"errors ({n_errors})")
+
+    ax.set_xticks([])
+    ax.set_xlabel(f"Backend servers  (Tier A ← fast    slow → Tier D)")
     ax.set_ylabel("Requests served")
-    ax.set_xlabel("Backend")
+    ax.set_title("Request distribution per backend  (colour = tier)")
     ax.legend(fontsize=9)
     ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
     fig.tight_layout()
@@ -177,71 +196,104 @@ def plot_request_distribution(requests, out_dir):
 
 
 def plot_response_times(requests, out_dir):
+    """Two subplots: rolling mean latency over time, and per-tier latency box plots."""
+    ok = [r for r in requests if r.get("status") == "ok"]
+    sr = sorted(ok, key=lambda r: r["req"])
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
 
-    by_srv = defaultdict(lambda: ([], []))
-    for r in requests:
-        srv = r["server"]
-        by_srv[srv][0].append(r["req"])
-        by_srv[srv][1].append(r["elapsed_s"] * 1000)
-
-    drawn = []
-    for name in SERVER_NAMES:
-        xs, ys = by_srv[name]
-        if xs:
-            sc = ax1.scatter(xs, ys, color=COLORS[name],
-                             marker=MARKERS[name], s=25, alpha=0.8,
-                             label=name if _num_servers <= _LEGEND_THRESHOLD else "_")
-            drawn.append(name)
-    if by_srv["error"][0]:
-        ax1.scatter(*by_srv["error"], label="500 error", color="#e05555",
-                    marker="x", s=50, zorder=5)
-        drawn.append("error")
-
-    ax1.set_title("Response latency per request")
-    ax1.set_xlabel("Request #")
+    # Left: rolling mean latency over request sequence
+    max_req = len(sr)
+    window = max(5, min(100, max_req // 20))
+    all_lats = [r["elapsed_s"] * 1000 for r in sr]
+    all_xs = [r["req"] for r in sr]
+    rolling = []
+    for i in range(len(all_lats)):
+        chunk = all_lats[max(0, i - window + 1): i + 1]
+        rolling.append(sum(chunk) / len(chunk))
+    ax1.scatter(all_xs, all_lats, s=4, alpha=0.25, color="#4C72B0", zorder=2)
+    ax1.plot(all_xs, rolling, color="#C44E52", linewidth=2.0, zorder=3,
+             label=f"rolling avg (w={window})")
+    n_err = sum(1 for r in requests if r.get("status") == "error")
+    if n_err:
+        err_xs = [r["req"] for r in requests if r.get("status") == "error"]
+        ax1.scatter(err_xs, [5000] * len(err_xs), marker="x", color="#e05555",
+                    s=30, zorder=4, label=f"errors ({n_err})")
+    ax1.set_title("Response latency over time")
+    ax1.set_xlabel("Request number")
     ax1.set_ylabel("Latency (ms)")
-    if _num_servers <= _LEGEND_THRESHOLD or "error" in drawn:
-        ax1.legend(fontsize=8, ncol=max(1, len(drawn) // 6))
+    ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.25)
 
-    data, labels, cols = [], [], []
-    for n in SERVER_NAMES:
-        vals = [r["elapsed_s"] * 1000 for r in requests
-                if r["server"] == n and r.get("status") == "ok"]
-        if vals:
-            data.append(vals)
-            labels.append(n)
-            cols.append(COLORS[n])
-    if data:
-        bp = ax2.boxplot(data, patch_artist=True,
-                         labels=labels if len(labels) <= 20 else [""] * len(labels),
-                         widths=0.5)
-        for patch, c in zip(bp["boxes"], cols):
-            patch.set_facecolor(c); patch.set_alpha(0.7)
-        if len(labels) > 10:
-            ax2.tick_params(axis="x", labelsize=6, rotation=90)
-    ax2.set_title("Latency distribution per backend (successful only)")
+    # Right: one box per tier (4 boxes instead of 50)
+    tier_data = defaultdict(list)
+    for r in ok:
+        tier_data[_server_tier(r["server"])].append(r["elapsed_s"] * 1000)
+    tier_order = [t for t in "ABCD" if tier_data[t]]
+    bp = ax2.boxplot(
+        [tier_data[t] for t in tier_order],
+        patch_artist=True,
+        labels=[f"Tier {t}" for t in tier_order],
+        widths=0.5,
+        medianprops=dict(color="white", linewidth=2),
+        flierprops=dict(marker=".", markersize=3, alpha=0.4),
+    )
+    for patch, t in zip(bp["boxes"], tier_order):
+        patch.set_facecolor(_TIER_COLORS[t])
+        patch.set_alpha(0.85)
+    ax2.set_title("Latency distribution per tier")
     ax2.set_ylabel("Latency (ms)")
-    ax2.set_xlabel("Backend")
+    ax2.set_xlabel("Server tier")
+    ax2.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     _save(fig, out_dir / "02_response_times.png")
 
 
 def plot_active_conns(selects, flow_removed, out_dir):
-    ts  = _events_to_step(selects, flow_removed, "active_conns")
+    """Active connections over time, aggregated by tier when N is large."""
+    ts = _events_to_step(selects, flow_removed, "active_conns")
     fig, ax = plt.subplots(figsize=(9, 4))
-    drawn = []
-    for name in SERVER_NAMES:
-        xs, ys = ts[name]
-        if len(xs) > 1:
-            ax.plot(xs, ys, color=COLORS[name], linewidth=1.5, alpha=0.75,
-                    label=name if _num_servers <= _LEGEND_THRESHOLD else "_")
-            drawn.append(name)
-    ax.set_title("Active connections per backend over time")
+
+    if _num_servers <= _LEGEND_THRESHOLD:
+        # Small pool: one line per server
+        for name in SERVER_NAMES:
+            xs, ys = ts[name]
+            if len(xs) > 1:
+                ax.plot(xs, ys, color=COLORS[name], linewidth=1.5, alpha=0.75, label=name)
+        ax.legend(fontsize=8)
+    else:
+        # Large pool: sum active conns per tier and plot 4 lines
+        all_events = sorted(
+            [e for e in selects + flow_removed if "active_conns" in e],
+            key=lambda e: e["t"],
+        )
+        if all_events:
+            t0 = all_events[0]["t"]
+            tier_vals = defaultdict(lambda: defaultdict(int))
+            last = {n: 0 for n in SERVER_NAMES}
+            times = []
+            snapshots = []
+            for ev in all_events:
+                name = ev.get("server")
+                if name not in last:
+                    continue
+                last[name] = ev["active_conns"]
+                t = ev["t"] - t0
+                times.append(t)
+                snap = defaultdict(int)
+                for n in SERVER_NAMES:
+                    snap[_server_tier(n)] += last[n]
+                snapshots.append(snap)
+            for t_letter, color in _TIER_COLORS.items():
+                ys = [s[t_letter] for s in snapshots]
+                if any(y > 0 for y in ys):
+                    ax.plot(times, ys, color=color, linewidth=1.8,
+                            alpha=0.85, label=f"Tier {t_letter}")
+        ax.legend(fontsize=9)
+
+    ax.set_title("Active connections over time  (aggregated by tier)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Active connections")
-    _add_server_legend(ax, drawn)
     ax.grid(True, alpha=0.3)
     ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
     fig.tight_layout()
@@ -249,32 +301,52 @@ def plot_active_conns(selects, flow_removed, out_dir):
 
 
 def plot_cumulative_selections(selects, out_dir):
+    """Cumulative selections over time, shown per tier for large pools."""
     if not selects:
         return
-    t0  = selects[0]["t"]
-    cum = {n: 0 for n in SERVER_NAMES}
-    ts  = {n: [0] for n in SERVER_NAMES}
-    vs  = {n: [0] for n in SERVER_NAMES}
-    for ev in selects:
-        n = ev.get("server")
-        if n in cum:
-            cum[n] += 1
-            t = ev["t"] - t0
-            for name in SERVER_NAMES:
-                ts[name].append(t)
-                vs[name].append(cum[name])
+    t0 = selects[0]["t"]
     fig, ax = plt.subplots(figsize=(9, 4))
-    drawn = []
-    for name in SERVER_NAMES:
-        if len(ts[name]) > 1:
-            ax.step(ts[name], vs[name], color=COLORS[name], linewidth=1.5,
-                    alpha=0.75, where="post",
-                    label=name if _num_servers <= _LEGEND_THRESHOLD else "_")
-            drawn.append(name)
-    ax.set_title("Cumulative requests assigned per backend")
+
+    if _num_servers <= _LEGEND_THRESHOLD:
+        cum = {n: 0 for n in SERVER_NAMES}
+        ts = {n: [0] for n in SERVER_NAMES}
+        vs = {n: [0] for n in SERVER_NAMES}
+        for ev in selects:
+            n = ev.get("server")
+            if n in cum:
+                cum[n] += 1
+                t = ev["t"] - t0
+                for name in SERVER_NAMES:
+                    ts[name].append(t)
+                    vs[name].append(cum[name])
+        for name in SERVER_NAMES:
+            if len(ts[name]) > 1:
+                ax.step(ts[name], vs[name], color=COLORS[name],
+                        linewidth=1.5, alpha=0.75, where="post", label=name)
+        ax.legend(fontsize=8)
+    else:
+        cum_tier = defaultdict(int)
+        tier_ts = defaultdict(lambda: [0])
+        tier_vs = defaultdict(lambda: [0])
+        for ev in selects:
+            n = ev.get("server")
+            if n not in COLORS:
+                continue
+            t = ev["t"] - t0
+            tier = _server_tier(n)
+            cum_tier[tier] += 1
+            for tl in "ABCD":
+                tier_ts[tl].append(t)
+                tier_vs[tl].append(cum_tier[tl])
+        for tl, color in _TIER_COLORS.items():
+            if len(tier_ts[tl]) > 1:
+                ax.step(tier_ts[tl], tier_vs[tl], color=color,
+                        linewidth=2.0, alpha=0.9, where="post", label=f"Tier {tl}")
+        ax.legend(fontsize=9)
+
+    ax.set_title("Cumulative selections over time  (aggregated by tier)")
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Total selections")
-    _add_server_legend(ax, drawn)
+    ax.set_ylabel("Total requests assigned")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     _save(fig, out_dir / "04_cumulative_selections.png")

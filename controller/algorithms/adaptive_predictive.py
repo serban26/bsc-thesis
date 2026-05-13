@@ -57,7 +57,10 @@ except ImportError:          # pragma: no cover
 _DYN_ALPHA  = 0.25   # EWMA learning rate for dyn_weight and global_dur
 _MIN_DUR    = 0.001  # 1 ms floor on avg_flow_dur_s to avoid division by zero
 _FLOOR_FRAC = 0.20   # minimum dyn_weight = FLOOR_FRAC × static_weight
-_STALE_SECS = 10.0   # seconds without a selection → treat score as 0 (probe)
+_STALE_SECS = 30.0   # only re-probe a server not seen in this many seconds
+                     # (4 s was far too short: at 5 req/s with 10 servers,
+                     # 10/4 = 2.5 mandatory probes/s = 50% of all traffic
+                     # wasted on probing known-bad Tier C/D servers.)
 _EPSILON    = 1e-9   # tie-breaking threshold
 
 

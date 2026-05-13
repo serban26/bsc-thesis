@@ -1,104 +1,134 @@
-# SDN Load Balancer — BSc Thesis
+# SDN Load Balancer
 
-Prototype SDN load balancer built with Mininet, Open vSwitch and Ryu.
-A client sends traffic to a virtual IP; the controller picks a backend
-server for each new flow and installs OpenFlow rules on the switch so
-the rest of the flow is handled in the data plane.
+A software-defined network load balancer built with Ryu + Mininet + Open vSwitch,
+implementing and comparing five scheduling algorithms on a heterogeneous server pool.
 
-## How it works
+## Overview
 
-1. A new flow arrives at the switch → `PacketIn` goes to the controller
-2. The controller runs the selected algorithm and picks a backend
-3. Two flow rules are installed (client→server and server→client),
-   rewriting the VIP to the real server IP so the client never sees the backend
-4. Following packets are handled by the switch directly
-5. When a flow expires the controller gets a `FlowRemoved` event and
-   updates the metrics
+The controller intercepts every new TCP connection to a Virtual IP (10.0.0.100) and
+selects a backend server using one of five algorithms. Flow rules are installed in OVS
+to transparently rewrite IP/MAC headers, so neither the client nor the servers need any
+special configuration.
 
-## Topology
+The experiment uses 50 backend servers arranged in four performance tiers:
 
-```
-  h1 (10.0.0.1) ──┐
-  h2 (10.0.0.2) ──┤
-  h3 (10.0.0.3) ──┤  s1 (OVS, OpenFlow 1.3) ◀── Ryu  127.0.0.1:6633
-  h4 (10.0.0.4) ──┘
+| Tier | Servers | Base delay    | Max concurrent | Spike ×  |
+|------|---------|---------------|----------------|----------|
+| A    | 20      | 5–25 ms       | 8–16           | 8×       |
+| B    | 10      | 50–150 ms     | 4–8            | 5×       |
+| C    | 10      | 300–600 ms    | 2–3            | 2×       |
+| D    | 10      | 800–1000 ms   | 1              | 1.5×     |
 
-  VIP : 10.0.0.100  /  VMAC : 00:00:00:00:01:00
-```
+## Algorithms
 
-h1 is the client. h2/h3/h4 each run a tiny HTTP server.
+| Name                  | Module                               | Key idea                                      |
+|-----------------------|--------------------------------------|-----------------------------------------------|
+| Round Robin           | `algorithms/round_robin.py`          | Cycle through servers, ignore all metrics     |
+| Weighted Round Robin  | `algorithms/weighted_round_robin.py` | Cycle proportional to static tier weight      |
+| Least Connections     | `algorithms/least_connections.py`    | Route to server with fewest active flows      |
+| Least Response Time   | `algorithms/least_response_time.py`  | Route to server with lowest EWMA latency      |
+| Adaptive Predictive   | `algorithms/adaptive_predictive.py`  | Work-left score + dynamic weight adaptation   |
 
-## Structure
+The Adaptive Predictive algorithm is the main contribution. Its routing score is
+`(active_conns + 1) × avg_flow_dur_s / dyn_weight`, which combines an immediate
+overload indicator with historical service time. A second EWMA layer continuously
+adjusts `dyn_weight` based on each server's throughput relative to the pool average.
+
+## Repository Layout
 
 ```
 controller/
-  load_balancer.py        main Ryu app
-  metrics.py              per-server metrics + scoring
+  load_balancer.py       # Ryu app: PacketIn, FlowRemoved, ARP handling
+  metrics.py             # Per-server metrics (active_conns, EWMA duration, etc.)
+  simple_switch.py       # Basic L2 forwarding (used separately)
   algorithms/
-    base.py               abstract base class
-    registry.py           name → class lookup
-    round_robin.py        weighted round robin
-    least_connections.py  pick the least loaded backend
-
+    base.py              # Abstract LoadBalancingAlgorithm class
+    registry.py          # Algorithm lookup by name
+    round_robin.py
+    weighted_round_robin.py
+    least_connections.py
+    least_response_time.py
+    adaptive_predictive.py
 topo/
-  run_net.py              interactive Mininet runner
-  run_net_auto.py         headless runner used by run_experiment.sh
-
+  simple_topo.py         # Mininet topology: 1 switch, 1 client, N servers
+  run_net.py             # Entry point with traffic generator and HTTP servers
+  run_net_auto.py        # Variant used by the automated experiment runner
 scripts/
-  run_experiment.sh       one-command experiment runner (interactive menu)
-  plot_metrics.py         generates result plots
-  _clean_net.sh           cleans leftover OVS state
-
+  run_experiment.sh      # Run one algorithm end-to-end; save results
+  compare.sh             # Run all five algorithms in sequence + comparison plots
+  start_ryu.sh           # Start the Ryu controller (called by run_experiment.sh)
+  start_mininet.sh       # Start the Mininet network (called by run_experiment.sh)
+  test_lb.sh             # Quick smoke test
+  plot_metrics.py        # Per-algorithm plots (distribution, response times, etc.)
+  plot_comparison.py     # Cross-algorithm comparison plots (8 figures)
+  _clean_net.sh          # Kill OVS/Mininet/Ryu leftover processes
+results/
+  round_robin/
+  weighted_round_robin/
+  least_connections/
+  least_response_time/
+  adaptive_predictive/
+  comparison/
 tests/
   test_metrics.py
   test_round_robin.py
 ```
 
-## Setup
+## Requirements
+
+- Python 3.7+ with a virtualenv at `.venv`
+- Ryu 4.34 (`pip install ryu`)
+- Mininet 2.3.x (system install: `sudo apt install mininet`)
+- Open vSwitch (system install)
+- matplotlib, numpy, pandas (`pip install matplotlib numpy pandas`)
+
+## Quick Start
 
 ```bash
-python3.7 -m venv .venv
+# activate the venv
 source .venv/bin/activate
-pip install ryu eventlet==0.30.2 pytest matplotlib
+
+# run all five algorithms and generate comparison plots (~10-15 min)
+bash scripts/compare.sh
+
+# or run a single algorithm
+LB_ALGORITHM=adaptive_predictive NUM_SERVERS=50 bash scripts/run_experiment.sh
 ```
 
-## Running an experiment
+Results are written to `results/<algorithm>/` and comparison plots to
+`results/comparison/`.
 
-```bash
-source .venv/bin/activate
-sudo bash scripts/run_experiment.sh
+## Configuration
+
+The following environment variables are read by the experiment scripts:
+
+| Variable        | Default        | Description                          |
+|-----------------|----------------|--------------------------------------|
+| `LB_ALGORITHM`  | `round_robin`  | Algorithm name (see table above)     |
+| `NUM_SERVERS`   | `50`           | Number of backend servers            |
+| `NUM_REQUESTS`  | `1500`         | Total requests in the timed run      |
+| `RATE`          | `40`           | Requests per second                  |
+| `MAX_WEIGHT`    | `16`           | Maximum static weight (Tier A)       |
+
+## Composite Score
+
+Algorithm performance is summarised by a single composite score:
+
+```
+S = R × E × F
 ```
 
-The script asks a few questions (algorithm, number of requests, delay
-between requests) then runs everything automatically — starts Ryu,
-runs Mininet, fires traffic, stops everything and drops plots in `results/`.
+where:
+- `R = 1 − error_rate` — reliability
+- `E = 1 / (1 + mean_latency_s)` — average speed
+- `F = 1 / (1 + p95_latency_s)` — tail behaviour
 
-## Algorithms
+Results from the 50-server experiment (1500 req, 40 req/s):
 
-Both live under `controller/algorithms/` and implement the same interface,
-so switching is just choosing at the prompt (or setting `LB_ALGORITHM`).
-
-**round_robin** — cycles through backends in order, ignores live metrics.
-Good baseline.
-
-**least_connections** — always picks the backend with the fewest active
-flows, weighted by capacity. Adapts to uneven response times.
-
-## Metrics collected per backend
-
-| metric | what it measures |
-|--------|-----------------|
-| `active_conns` | open flows right now (main signal for least-connections) |
-| `total_bytes` | cumulative bytes served |
-| `throughput_bps` | recent throughput from port stats |
-| `conn_rate_eps` | EWMA arrival rate |
-| `avg_flow_dur_s` | EWMA of completed flow durations |
-| `port_errors` | tx/rx errors + drops |
-| `score` | composite of the above, lower = preferred |
-
-## Tests
-
-```bash
-source .venv/bin/activate
-python -m pytest tests/
-```
+| Algorithm | Mean (ms) | p95 (ms) | Errors | Score    |
+|-----------|-----------|----------|--------|----------|
+| AP        | 92        | 241      | 0.6 %  | **0.73** |
+| LRT       | 126       | 502      | 0.4 %  | 0.59     |
+| WRR       | 172       | 690      | 1.0 %  | 0.50     |
+| LC        | 191       | 911      | 0.9 %  | 0.44     |
+| RR        | 361       | 1144     | 1.0 %  | 0.34     |
