@@ -10,19 +10,19 @@ except ImportError:  # pragma: no cover
 
 
 class LoadBalancingAlgorithm(ABC):
-    """Base class for load-balancing algorithms."""
+    """All algorithms extend this."""
 
     name: str = "abstract"
 
     @abstractmethod
-    def select(self, servers: Sequence[ServerMetrics]) -> ServerMetrics:
-        """Pick a backend for the next incoming flow."""
+    def select(self, servers: Sequence[ServerMetrics], traffic_class: str = "http") -> ServerMetrics:
+        """Choose a server for the next request."""
 
     def on_selected(self, server: ServerMetrics) -> None:
-        """Called after a server is picked.  Override if you need it."""
+        """Hook called after a server is chosen. Override if the algorithm needs it."""
 
     def on_flow_removed(self, server: ServerMetrics) -> None:
-        """Called when a forward flow for this server expires."""
+        """Hook called when a flow expires. Override to update internal state."""
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} name={self.name!r}>"

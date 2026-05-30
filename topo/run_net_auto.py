@@ -45,37 +45,14 @@ NUM_REQUESTS  = int(os.environ.get("LB_REQUESTS", sys.argv[1] if len(sys.argv) >
 DRAIN_SECS    = int(os.environ.get("LB_DRAIN",    sys.argv[2] if len(sys.argv) > 2 else "5"))
 REQUESTS_CSV  = os.environ.get("LB_REQUESTS_CSV", "/tmp/lb_requests.csv")
 NUM_SERVERS   = int(os.environ.get("LB_NUM_SERVERS", "3"))
-# Rate at which the client fires requests (requests/second).
-#
-# With 50 servers at RATE=40: each server receives 0.8 req/s from RR.
-# Tier D (last 10%, 800-1000 ms service, max_concurrent=1):
-#   capacity ≈ 1.0-1.25 req/s  →  ρ ≈ 0.65-0.80
-#   M/M/1 mean wait = ρ/(1-ρ) × E[S] ≈ 1.5-3.2 s  →  total ≈ 2-4 s per req
-# AP avoids Tier D after warm-up  →  mean ≈ 30-60 ms (Tier A+B only)
-# → RR mean ~400 ms  vs  AP mean ~40 ms  — 10× difference in every plot
-RATE = float(os.environ.get("LB_RATE", "40.0"))
+RATE = float(os.environ.get("LB_RATE", "40.0"))  # requests/second per client
+NUM_CLIENTS = int(os.environ.get("LB_NUM_CLIENTS", "5"))
 
 import shutil
 
 _SCRIPT_DIR = "/tmp/lb_servers"
 
-# ─── heterogeneous server pool ─────────────────────────────────────────────
-#
-# Servers are ordered best-first (h2 = fastest, hN = slowest) so that WRR
-# weights (higher index → lower weight) naturally align with capacity, and
-# smart algorithms (LC, LRT, AP) converge on the fast tier quickly.
-#
-# Four performance tiers based on fractional position in the pool:
-#   A (fast,   first 40%): powerful machines, low latency, high concurrency
-#   B (medium, next  30%): standard rack servers
-#   C (slow,   next  20%): underpowered / CPU-saturated machines
-#   D (legacy, last  10%): old hardware, strictly single-threaded
-#
-# At RATE=40 with 50 servers (RR sends 0.8 req/s per server):
-#   Tier D capacity ≈ 1.0-1.25 req/s  →  ρ ≈ 0.65-0.80
-#   M/M/1 mean wait = ρ/(1-ρ) × E[S] ≈ 1.5-3 s  →  total ≈ 2-4 s per request
-#   AP avoids Tier D after warm-up → mean ≈ 30-60 ms (Tier A+B only)
-#   Result: RR mean ~400 ms  vs  AP mean ~40 ms  — 10× visible in every plot
+# server tiers: A=fast (first 40%), B=medium (next 30%), C=slow (next 20%), D=legacy (last 10%)
 _TIER_THRESHOLDS = (0.40, 0.70, 0.90)   # A<40% ≤ B<70% ≤ C<90% ≤ D
 
 _TIER_PARAMS = {
@@ -88,16 +65,6 @@ _TIER_PARAMS = {
               spike_mul=2.0,  spike_period=30.0, spike_duration=8.0),
     'D': dict(base_lo=800,  base_hi=1000,jit_lo=60, jit_hi=120, spike=0.02, err=0.020, conc_lo=1,  conc_hi=1,
               spike_mul=1.5,  spike_period=40.0, spike_duration=6.0),
-    # Why different multipliers per tier?
-    # AP's advantage over LRT comes from detecting a spike IN-FLIGHT via
-    # active_conns, before avg_flow_dur rises through EWMA (takes 5-6 flows).
-    # Spikes on FAST (Tier A) servers are the most revealing scenario:
-    #   Tier A: 15 ms × 8 = 120 ms spike.  With conc=8 and RATE=40 sending
-    #           0.8 req/s per server, the semaphore fills within 2-3 requests.
-    #           AP sees active_conns rise → routes elsewhere immediately.
-    #           LRT only detects after EWMA reflects 120 ms (5-6 completions).
-    # Tier D: 900 ms × 1.5 = 1350 ms.  Low multiplier prevents queued
-    #         requests from exceeding the 5 s client timeout.
 }
 
 # Network link delays per tier (fast servers = good network placement)
@@ -123,10 +90,20 @@ def build():
                   autoSetMacs=False, build=False)
     net.addController("c0", controller=RemoteController,
                       ip="127.0.0.1", port=6633)
-    s1 = net.addSwitch("s1", protocols="OpenFlow13")
+    s1 = net.addSwitch("s1", protocols="OpenFlow13", batch=True)
+
+    # h1 is the main client; extra clients use 10.0.0.200+ to avoid colliding with server IPs
+    clients = []
     h1 = net.addHost("h1", ip=f"{CLIENT_IP}/24", mac=CLIENT_MAC)
-    # client link: low base delay, small jitter
     net.addLink(h1, s1, delay="2ms", jitter="1ms")
+    clients.append(h1)
+    for ci in range(1, NUM_CLIENTS):
+        cip  = f"10.0.0.{200 + ci - 1}"
+        cmac = f"00:00:00:00:02:{ci:02x}"
+        ch   = net.addHost(f"hc{ci + 1}", ip=f"{cip}/24", mac=cmac)
+        net.addLink(ch, s1, delay="2ms", jitter="1ms")
+        clients.append(ch)
+
     servers = []
     for idx in range(NUM_SERVERS):
         i    = idx + 2
@@ -135,7 +112,7 @@ def build():
                            mac=f"00:00:00:00:00:{i:02x}")
         net.addLink(h, s1, **_TIER_LINK[tier])
         servers.append(h)
-    return net, h1, servers
+    return net, clients, servers
 
 
 def _prepare_script_dir():
@@ -143,18 +120,14 @@ def _prepare_script_dir():
     os.makedirs(_SCRIPT_DIR, mode=0o755, exist_ok=True)
 
 
-# ─── per-server processing-time profiles ───────────────────────────────────
-# Generated from _TIER_PARAMS using a per-server deterministic RNG so every
-# algorithm run sees identical server behaviour (fair comparison).
-# max_concurrent = semaphore inside the server: controls real parallelism.
-# Tier D (max_concurrent=1) strictly queues incoming requests, creating
-# measurable back-pressure that LC/LRT/AP learn to avoid.
+# per-server processing-time profiles, generated deterministically so every
+# algorithm run sees the same server behaviour (for fair comparison)
 _SERVER_PROFILES = {}
 for _idx in range(NUM_SERVERS):
     _hname = f"h{_idx + 2}"
     _tier  = _assign_tier(_idx, NUM_SERVERS)
     _p     = _TIER_PARAMS[_tier]
-    # Large prime multiplier spreads seeds far apart to avoid correlation
+    # large prime spreads seeds apart to reduce correlation
     _rng   = random.Random(_idx * 0x9E3779B9 & 0xFFFFFFFF)
     _SERVER_PROFILES[_hname] = dict(
         base_ms        = int(_rng.uniform(_p['base_lo'],  _p['base_hi'])),
@@ -173,15 +146,9 @@ def _write_server_script(host_name: str, host_ip: str) -> str:
     body = f"served by {host_name} ({host_ip})"
     p = _SERVER_PROFILES.get(host_name, dict(base_ms=10, jitter_ms=5,
                                               spike_prob=0.05, error_prob=0.03))
-    # Deterministic per-server seed derived from the host name.
-    # Every algorithm run starts the same server with the same seed,
-    # so the sequence of delays/errors is identical across runs.
-    # Different servers still behave differently (different profiles AND seeds).
+    # deterministic seed so the same server produces the same delay/error sequence every run
     seed_val = sum(ord(c) * (i + 1) for i, c in enumerate(host_name))
-    # Stagger spike offsets so no two servers spike at the same time.
-    # Each server waits (index / N) * SPIKE_PERIOD seconds before its first spike.
-    # This mimics reality: GC pauses, cron jobs, and noisy-neighbour events
-    # on different machines are independent and hit at different times.
+    # stagger spike offsets so servers don't all spike at the same time
     host_idx        = int(host_name[1:]) - 2   # h2→0, h3→1, …
     spike_period    = 30.0
     spike_offset_v  = round((host_idx * spike_period) / max(NUM_SERVERS, 1), 2)
@@ -315,14 +282,17 @@ def stop_servers(servers):
         h.cmd(f"pkill -f 'python3 {script}' 2>/dev/null; true")
 
 
-def prime_arp(client, servers):
-    """Pre-populate ARP so neither client nor servers have to ARP on first pkt."""
-    client.cmd(f"ip neigh replace {VIP} lladdr {VMAC} dev {client.name}-eth0")
+def prime_arp(clients, servers):
+    """Pre-populate ARP so neither clients nor servers have to ARP on first pkt."""
+    for client in clients:
+        client.cmd(f"ip neigh replace {VIP} lladdr {VMAC} dev {client.name}-eth0")
     for srv in servers:
-        srv.cmd(
-            f"ip neigh replace {CLIENT_IP} lladdr {CLIENT_MAC}"
-            f" dev {srv.name}-eth0"
-        )
+        # Teach every server about every client so return packets flow immediately.
+        for client in clients:
+            srv.cmd(
+                f"ip neigh replace {client.IP()} lladdr {client.MAC()}"
+                f" dev {srv.name}-eth0"
+            )
 
 
 def wait_for_controller(client, retries=20, interval=1.0):
@@ -346,8 +316,8 @@ def wait_for_controller(client, retries=20, interval=1.0):
 _CLIENT_SCRIPT = "/tmp/lb_client.py"
 
 
-def _write_client_script(total: int, rate: float) -> None:
-    """Write a Python load-generator to /tmp/lb_client.py.
+def _write_client_script(total: int, rate: float, path: str = _CLIENT_SCRIPT) -> None:
+    """Write a Python load-generator to *path*.
 
     Uses urllib.request (pure Python, in-process) instead of subprocess curl.
     This is critical: subprocess.run() inside threads spawned inside
@@ -358,24 +328,39 @@ def _write_client_script(total: int, rate: float) -> None:
     """
     delay = 1.0 / rate
     script = f"""#!/usr/bin/env python3
-import threading, time, json
+import threading, time, json, random
 import urllib.request, urllib.error
 
 TOTAL   = {total}
 DELAY   = {delay:.4f}   # 1 / rate  ({rate:.1f} req/s)
-URL     = "http://{VIP}:{HTTP_PORT}/"
-# 5 s timeout.  Tier D (800-1000 ms, cap=1) at ρ≈0.72 (M/M/1) produces
-# a mean queue wait of ~2.3 s → total response ~3.2 s.  Smart algorithms
-# avoid Tier D entirely so their requests complete in <200 ms.
-TIMEOUT = 5.0
+VIP     = "{VIP}"
+TIMEOUT = 15.0
+
+# traffic class mix: (class_name, vip_port, cumulative_weight)
+_MIX_CUM = [
+    ("http",  8000, 0.35),
+    ("maps",   443, 0.50),
+    ("video",  554, 0.70),
+    ("audio", 1755, 0.85),
+    ("voip",  5060, 1.00),
+]
+
+def _pick_class():
+    r = random.random()
+    for cls, port, cum in _MIX_CUM:
+        if r < cum:
+            return cls, port
+    return "http", 8000
 
 results = [None] * TOTAL
 _lock   = threading.Lock()
 
 def fire(i):
+    tc, port = _pick_class()
+    url = f"http://{{VIP}}:{{port}}/"
     t0 = time.time()
     try:
-        with urllib.request.urlopen(URL, timeout=TIMEOUT) as resp:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
             body = resp.read().decode("utf-8", errors="replace").strip()
     except urllib.error.HTTPError as exc:
         body = f"error: HTTP {{exc.code}}"
@@ -383,7 +368,7 @@ def fire(i):
         body = f"error: {{exc}}"
     elapsed = round(time.time() - t0, 4)
     with _lock:
-        results[i] = {{"i": i + 1, "elapsed": elapsed, "body": body}}
+        results[i] = {{"i": i + 1, "elapsed": elapsed, "body": body, "tc": tc}}
 
 threads = []
 for i in range(TOTAL):
@@ -394,81 +379,123 @@ for i in range(TOTAL):
         time.sleep(DELAY)
 
 for t in threads:
-    t.join(timeout=TIMEOUT + 5.0)
+    t.join(timeout=TIMEOUT + 10.0)
 
 print(json.dumps(results))
 """
-    with open(_CLIENT_SCRIPT, "w") as fh:
+    with open(path, "w") as fh:
         fh.write(script)
 
 
-def run_requests(client, n):
-    """Fire n HTTP GETs at RATE req/s using a threaded Python client on h1.
+def run_requests(clients, n):
+    """Fire n HTTP GETs at RATE req/s distributed across all clients.
 
-    Requests overlap: the client fires one every 1/RATE seconds regardless
-    of whether previous ones have finished.  This creates real concurrent
-    load that exposes the queue at slow servers.
+    With a single client the behaviour is identical to before.
+    With multiple clients each fires n//len(clients) requests concurrently
+    using Python threads (safe in Mininet — each host.cmd() runs in the
+    host's own network namespace).
     """
+    import threading
+
     server_names = [f"h{2 + i}" for i in range(NUM_SERVERS)]
+    num_clients  = len(clients)
 
-    _write_client_script(n, RATE)
-    print(f"\nFiring {n} requests at {RATE:.1f} req/s to http://{VIP}:{HTTP_PORT}/")
-    print(f"  (inter-request delay: {1000/RATE:.0f}ms, {NUM_SERVERS} servers, "
-          f"Tier D capacity ~1.0-1.25 req/s)")
-    # For large runs print ~20 progress lines instead of one per request
+    # Divide requests as evenly as possible; last client gets the remainder.
+    base  = n // num_clients
+    slices = [base] * num_clients
+    slices[-1] += n - base * num_clients
+
+    # Each client fires at RATE/N so the aggregate load on the pool stays
+    # constant regardless of how many clients are used.  This makes runs with
+    # different client counts comparable to each other.
+    per_client_rate = RATE / num_clients
+
+    print(f"\nFiring {n} requests at {RATE:.1f} req/s total to http://{VIP}:{HTTP_PORT}/"
+          f"  ({num_clients} client(s) × {per_client_rate:.1f} req/s each, "
+          f"{NUM_SERVERS} servers, Tier D capacity ~1.0-1.25 req/s)")
+
+    results: list = [None] * num_clients
+
+    def _fire(idx: int, client, count: int) -> None:
+        script_path = f"/tmp/lb_client_{idx}.py"
+        _write_client_script(count, per_client_rate, script_path)
+        raw = client.cmd(f"python3 {script_path}")
+        raw = raw.strip()
+        json_start = raw.find('[')
+        if json_start > 0:
+            raw = raw[json_start:]
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"[ERROR] client {idx} could not parse output ({exc}): {raw[:300]}")
+            results[idx] = []
+            return
+        recs = []
+        for item in sorted(data, key=lambda x: (x or {}).get("i", 0)):
+            if item is None:
+                continue
+            body    = item.get("body", "")
+            elapsed = item.get("elapsed", 0.0)
+            req_i   = item.get("i", 0)
+            srv    = "other"
+            status = "other"
+            for name in server_names:
+                if f"served by {name} " in body:
+                    srv    = name
+                    status = "ok"
+                    break
+            if srv == "other":
+                # Distinguish real timeouts from HTTP errors
+                if "timed out" in body or "TimeoutError" in body or "urlopen error" in body and "timed out" in body:
+                    status = "timeout"
+                else:
+                    status = "error"
+                srv = "error"
+            recs.append({"req": req_i, "server": srv, "status": status,
+                         "elapsed_s": elapsed, "traffic_class": item.get("tc", "http"),
+                         "body": body[:80]})
+        results[idx] = recs
+
+    if num_clients == 1:
+        _fire(0, clients[0], n)
+    else:
+        threads = [
+            threading.Thread(target=_fire, args=(i, clients[i], slices[i]), daemon=True)
+            for i in range(num_clients)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    # Merge results from all clients and renumber requests globally.
     _print_step = max(1, n // 20)
-
-    raw = client.cmd(f"python3 {_CLIENT_SCRIPT}")
-
-    # strip any stray mininet prompt / newlines that might prefix the JSON
-    raw = raw.strip()
-    json_start = raw.find('[')
-    if json_start > 0:
-        raw = raw[json_start:]
-
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError) as exc:
-        print(f"[ERROR] could not parse client output ({exc}): {raw[:300]}")
-        return []
-
     records = []
-    for item in sorted(data, key=lambda x: (x or {}).get("i", 0)):
-        if item is None:
-            continue
-        body    = item.get("body", "")
-        elapsed = item.get("elapsed", 0.0)
-        req_i   = item.get("i", 0)
-
-        srv    = "other"
-        status = "other"
-        for name in server_names:
-            if f"served by {name} " in body:
-                srv    = name
-                status = "ok"
-                break
-        if srv == "other":
-            status = "error"
-            srv    = "error"
-
-        records.append({
-            "req":       req_i,
-            "server":    srv,
-            "status":    status,
-            "elapsed_s": elapsed,
-            "body":      body[:80],
-        })
-        tag = f"  \033[31m[err/timeout]\033[0m" if status == "error" else ""
-        if n <= 100 or req_i % _print_step == 0 or req_i == n or status == "error":
-            tier = _assign_tier(server_names.index(srv), NUM_SERVERS) if srv in server_names else "?"
-            print(f"  [{req_i:5d}/{n}] {srv:6s} tier={tier}  ({elapsed*1000:.0f} ms){tag}")
+    global_i = 1
+    for idx, recs in enumerate(results):
+        for r in (recs or []):
+            r["req"] = global_i
+            if r["status"] == "timeout":
+                tag = "  \033[31m[TIMEOUT]\033[0m"
+            elif r["status"] in ("error", "other"):
+                tag = "  \033[33m[HTTP err]\033[0m"
+            else:
+                tag = ""
+            srv = r["server"]
+            if n <= 100 or global_i % _print_step == 0 or global_i == n or r["status"] == "error":
+                tier = _assign_tier(server_names.index(srv), NUM_SERVERS) if srv in server_names else "?"
+                cli_tag = f" c{idx+1}" if num_clients > 1 else ""
+                tc_tag = f"[{r.get('traffic_class', 'http')[:4]}]"
+                print(f"  [{global_i:5d}/{n}]{cli_tag} {srv:6s} tier={tier} {tc_tag}  ({r['elapsed_s']*1000:.0f} ms){tag}")
+            records.append(r)
+            global_i += 1
 
     return records
 
 
 def save_csv(records, path):
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["req", "server", "status", "elapsed_s", "body"])
+        w = csv.DictWriter(f, fieldnames=["req", "server", "status", "elapsed_s", "traffic_class", "body"])
         w.writeheader()
         w.writerows(records)
     print(f"\nPer-request CSV -> {path}")
@@ -476,25 +503,88 @@ def save_csv(records, path):
 
 def main():
     setLogLevel("warning")       # suppress mininet noise; controller logs separately
-    net, h1, servers = build()
+    net, clients, servers = build()
+    h1 = clients[0]             # first client — used for warm-up and wait check
     net.build()
     net.start()
 
     try:
+        # ── Verify OVS port assignments match what the controller expects ──
+        # OVS normally assigns ports sequentially, but it is worth confirming
+        # so that debugging is quick if something is off.
+        import subprocess as _sp
+        _portmap = {}   # hostname -> actual OVS port number
+        try:
+            _ofctl = _sp.check_output(
+                ["sudo", "ovs-ofctl", "-O", "OpenFlow13", "show", "s1"],
+                stderr=_sp.DEVNULL, text=True,
+            )
+            import re as _re
+            for _m in _re.finditer(r'(\d+)\(([^)]+)\)', _ofctl):
+                _portno, _ifname = int(_m.group(1)), _m.group(2)
+                # interface names look like "h2-eth0", "hc3-eth0"
+                _hname = _ifname.split("-")[0]
+                _portmap[_hname] = _portno
+        except Exception as _e:
+            print(f"[WARN] could not read OVS port map: {_e}")
+
+        if _portmap:
+            import json as _json
+            _portmap_path = "/tmp/lb_portmap.json"
+            with open(_portmap_path, "w") as _pf:
+                _json.dump(_portmap, _pf)
+            print(f"OVS port map written to {_portmap_path}")
+            expected_offset = 1 + NUM_CLIENTS
+            first_server_name = f"h{2}"
+            actual_port = _portmap.get(first_server_name)
+            if actual_port is not None and actual_port != expected_offset:
+                print(f"[WARN] Port mismatch: controller expects {first_server_name} "
+                      f"on port {expected_offset}, OVS says port {actual_port}. "
+                      f"Set LB_SERVER_PORT_OFFSET={actual_port} to fix.")
+            else:
+                print(f"Port check OK: {first_server_name} on port "
+                      f"{actual_port or expected_offset} (expected {expected_offset}).")
+
         disable_offload(net.hosts)
         start_servers(servers)
-        prime_arp(h1, servers)
+        # Wait proportionally to the number of servers so all Python HTTP
+        # processes are ready before warm-up starts.
+        _srv_start_sleep = max(1.5, 0.05 * NUM_SERVERS)
+        time.sleep(_srv_start_sleep - 1.0)   # start_servers already sleeps 1.0 s
+        prime_arp(clients, servers)
 
-        print(f"  client : {h1.name} ({h1.IP()})")
+        for cl in clients:
+            print(f"  client : {cl.name} ({cl.IP()}) "
+                  f"port={_portmap.get(cl.name, '?')}")
         for s in servers:
-            print(f"  server : {s.name} ({s.IP()})  http://*:{HTTP_PORT}")
+            print(f"  server : {s.name} ({s.IP()})  http://*:{HTTP_PORT} "
+                  f"port={_portmap.get(s.name, '?')}")
         print(f"  VIP    : {VIP}")
 
         if not wait_for_controller(h1):
             print("[WARN] controller did not respond; continuing anyway")
 
+        # ── Quick connectivity check: try one direct request to the fastest server ──
+        # If even the direct request fails, the server HTTP process or ARP is broken.
+        # If VIP fails but direct succeeds, the controller port mapping is wrong.
+        _fast_server = servers[0]
+        _check_direct = h1.cmd(
+            f"python3 -c \"import urllib.request; "
+            f"urllib.request.urlopen('http://{_fast_server.IP()}:{HTTP_PORT}/', timeout=2); "
+            f"print('direct OK')\" 2>&1"
+        ).strip()
+        _check_vip = h1.cmd(
+            f"python3 -c \"import urllib.request; "
+            f"urllib.request.urlopen('http://{VIP}:{HTTP_PORT}/', timeout=2); "
+            f"print('VIP OK')\" 2>&1"
+        ).strip()
+        print(f"  Connectivity: direct={_check_direct!r}  VIP={_check_vip!r}")
+        if "VIP OK" not in _check_vip:
+            print("[WARN] VIP connectivity check failed — controller may have wrong port assignments.")
+            print("       Check Ryu log: grep 'portmap\\|LB:' /tmp/lb_ryu.log | head -20")
+
         # ── VIP warm-up ────────────────────────────────────────────────────
-        # Fire 3 rounds × NUM_SERVERS requests through the VIP (not direct IPs)
+        # Fire 5 rounds × NUM_SERVERS requests through the VIP (not direct IPs)
         # before the timed experiment.  This seeds avg_flow_dur_s for every
         # server in the controller so all algorithms start the real test with
         # real latency measurements instead of zero.
@@ -506,22 +596,41 @@ def main():
         # With VIP warm-up, AP immediately knows h2 (fast) from h11 (slow)
         # and routes to fast servers from request #1.
         #
+        # 5 rounds gives each server ~5 completed flows → DBA EWMA (α=0.25)
+        # converges to within ~75% of steady-state after 5 updates.
+        # Interval = 50 ms (was 150 ms): covers all N servers in 0.05×5N s
+        # so the warm-up finishes well before DRAIN_SECS.
+        #
         # The warm-up results are NOT saved to the experiment CSV.
-        warmup_n = 3 * NUM_SERVERS
-        print(f"\nVIP warm-up: {warmup_n} requests to seed server metrics\u2026")
+        warmup_rounds = 5
+        warmup_n = warmup_rounds * NUM_SERVERS
+        print(f"\nVIP warm-up: {warmup_n} requests ({warmup_rounds} rounds × {NUM_SERVERS} servers) to seed server metrics…")
         _wu_script = "/tmp/lb_warmup.py"
         with open(_wu_script, "w") as _wf:
-            _wf.write(f"""import urllib.request, time
-for i in range({warmup_n}):
-    try: urllib.request.urlopen('http://{VIP}:{HTTP_PORT}/', timeout=4)
+            _wf.write(f"""import urllib.request, time, threading
+
+TOTAL   = {warmup_n}
+DELAY   = {1.0 / max(warmup_n, 1):.4f}   # stagger launches slightly so RR cycles all servers
+URL     = "http://{VIP}:{HTTP_PORT}/"
+TIMEOUT = 5.0   # warm-up timeout: longer than before to actually complete Tier D requests
+
+def _fire(i):
+    try: urllib.request.urlopen(URL, timeout=TIMEOUT)
     except: pass
-    time.sleep(0.15)
+
+threads = [threading.Thread(target=_fire, args=(i,), daemon=True) for i in range(TOTAL)]
+for i, t in enumerate(threads):
+    t.start()
+    time.sleep(DELAY)
+for t in threads:
+    t.join(timeout=TIMEOUT + 1.0)
+print("warmup done")
 """)
         h1.cmd(f"python3 {_wu_script}")
         print(f"  Done. Waiting {DRAIN_SECS}s for FlowRemoved events to arrive…")
         time.sleep(DRAIN_SECS)
 
-        records = run_requests(h1, NUM_REQUESTS)
+        records = run_requests(clients, NUM_REQUESTS)
         save_csv(records, REQUESTS_CSV)
 
         # Summary

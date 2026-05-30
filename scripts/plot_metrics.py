@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""
-Plot results from a load-balancer experiment run.
+"""Plot results from a load-balancer experiment run.
 
 Usage:
     python3 scripts/plot_metrics.py [--metrics FILE] [--requests FILE] [--out DIR]
-
-Scale-safe: works for any number of backends (3 … 100+).
-Legends list server names only when N <= 12; for larger pools a
-colour-bar (server index) is shown instead.
 """
 
 from __future__ import annotations
@@ -35,8 +30,7 @@ except ImportError:
 _num_servers = int(os.environ.get("LB_NUM_SERVERS", "3"))
 SERVER_NAMES = [f"h{2 + i}" for i in range(_num_servers)]
 
-# For small pools use a categorical palette; for large pools use a smooth
-# colormap so the legend can be replaced by a colorbar.
+# for small pools use a categorical palette; for large pools use a smooth colormap
 _LEGEND_THRESHOLD = 12   # show named legend up to this many servers
 
 _cmap = cm.get_cmap("tab20" if _num_servers <= 20 else "viridis", _num_servers)
@@ -230,17 +224,22 @@ def plot_response_times(requests, out_dir):
     for r in ok:
         tier_data[_server_tier(r["server"])].append(r["elapsed_s"] * 1000)
     tier_order = [t for t in "ABCD" if tier_data[t]]
-    bp = ax2.boxplot(
-        [tier_data[t] for t in tier_order],
-        patch_artist=True,
-        labels=[f"Tier {t}" for t in tier_order],
-        widths=0.5,
-        medianprops=dict(color="white", linewidth=2),
-        flierprops=dict(marker=".", markersize=3, alpha=0.4),
-    )
-    for patch, t in zip(bp["boxes"], tier_order):
-        patch.set_facecolor(_TIER_COLORS[t])
-        patch.set_alpha(0.85)
+    if tier_order:
+        bp = ax2.boxplot(
+            [tier_data[t] for t in tier_order],
+            patch_artist=True,
+            labels=[f"Tier {t}" for t in tier_order],
+            widths=0.5,
+            medianprops=dict(color="white", linewidth=2),
+            flierprops=dict(marker=".", markersize=3, alpha=0.4),
+        )
+        for patch, t in zip(bp["boxes"], tier_order):
+            patch.set_facecolor(_TIER_COLORS[t])
+            patch.set_alpha(0.85)
+    else:
+        ax2.text(0.5, 0.5, "No successful requests",
+                 ha="center", va="center", transform=ax2.transAxes,
+                 fontsize=12, color="red")
     ax2.set_title("Latency distribution per tier")
     ax2.set_ylabel("Latency (ms)")
     ax2.set_xlabel("Server tier")

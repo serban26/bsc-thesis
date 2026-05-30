@@ -47,7 +47,7 @@ esac
 echo ""
 echo -e "  ${BOLD}Traffic parameters${RESET}"
 NUM_REQUESTS=$(ask "Number of HTTP requests per run" "1500")
-RATE=$(ask "Request rate (req/s sent from client)" "40")
+RATE=$(ask "Request rate (req/s sent from client)" "80")
 
 echo ""
 echo -e "  ${BOLD}Backend servers${RESET}  ${DIM}(ordered best-first: h2=fastest Tier A, hN=slowest Tier D)${RESET}"
@@ -56,6 +56,10 @@ NUM_SERVERS=$(ask "Number of backend servers (h2..hN)" "50")
 echo ""
 echo -e "  ${BOLD}Backend weights${RESET}  ${DIM}(Tier A weight; B gets /4, C gets /8, D gets 1 -- mirrors server capacity)${RESET}"
 MAX_WEIGHT=$(ask "Max weight (Tier A)" "16")
+
+echo ""
+echo -e "  ${BOLD}Clients${RESET}  ${DIM}(number of simultaneous load-generator hosts; requests split evenly)${RESET}"
+NUM_CLIENTS=$(ask "Number of clients" "10")
 
 # Tier-based weight generation: mirrors the 4-tier server pool in run_net_auto.py.
 #   Tier A (fast,   first 40%): MAX_WEIGHT        -- powerful machines
@@ -87,6 +91,7 @@ DRAIN_SECS=15
 echo ""
 echo -e "  ${GREEN}▶  algorithm(s) :${RESET} ${ALGOS[*]}"
 echo -e "  ${GREEN}▶  servers      :${RESET} $NUM_SERVERS  (h2 … h$((NUM_SERVERS + 1)))"
+echo -e "  ${GREEN}▶  clients      :${RESET} $NUM_CLIENTS"
 echo -e "  ${GREEN}▶  requests     :${RESET} $NUM_REQUESTS  at ${RATE} req/s"
 echo -e "  ${GREEN}▶  weights      :${RESET} $WEIGHTS"
 echo ""
@@ -124,6 +129,9 @@ for ALGO in "${ALGOS[@]}"; do
     echo -e "${BOLD}━━━  $ALGO  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 
     echo -e "${BOLD}[1/3] Cleaning up…${RESET}"
+    stop_ryu
+    pkill -9 -f 'ryu-manager' 2>/dev/null || true
+    sleep 1
     sudo ./scripts/_clean_net.sh 2>/dev/null || true
     sudo rm -f "$METRICS_FILE" "$REQUESTS_CSV" "$RYU_LOG" "$RYU_PID_FILE"
 
@@ -132,6 +140,7 @@ for ALGO in "${ALGOS[@]}"; do
     LB_METRICS_FILE="$METRICS_FILE" \
     LB_WEIGHTS="$WEIGHTS" \
     LB_NUM_SERVERS="$NUM_SERVERS" \
+    LB_NUM_CLIENTS="$NUM_CLIENTS" \
         "$VENV_RYU" --observe-links controller/load_balancer.py \
         > "$RYU_LOG" 2>&1 &
     echo "$!" > "$RYU_PID_FILE"
@@ -140,6 +149,11 @@ for ALGO in "${ALGOS[@]}"; do
         || ss -tlnp 2>/dev/null | grep -q ':6633'; then
             echo -e "  controller is up."
             break
+        fi
+        if ! kill -0 "$(cat "$RYU_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+            echo -e "  [ERROR] Ryu process died. Log:"
+            cat "$RYU_LOG" || true
+            exit 1
         fi
         sleep 1
     done
@@ -151,6 +165,7 @@ for ALGO in "${ALGOS[@]}"; do
     LB_RATE="$RATE" \
     LB_REQUESTS_CSV="$REQUESTS_CSV" \
     LB_NUM_SERVERS="$NUM_SERVERS" \
+    LB_NUM_CLIENTS="$NUM_CLIENTS" \
         sudo -E python3 topo/run_net_auto.py
 
     sleep 2

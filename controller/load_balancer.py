@@ -1,29 +1,7 @@
-"""
-Adaptive load-balancing controller (Phase 2).
-
-Topology assumptions (see topo/simple_topo.py):
-
-    h1 (10.0.0.1)   client            -> port 1 on s1
-    h2 (10.0.0.2)   server #1         -> port 2 on s1
-    h3 (10.0.0.3)   server #2         -> port 3 on s1
-    h4 (10.0.0.4)   server #3         -> port 4 on s1
-
-The controller exposes a Virtual IP (VIP) that the client uses to reach
-"the service". On every new client->VIP flow, the controller picks the
-backend with the lowest adaptive score and installs:
-
-    forward flow : (client_ip, VIP, l4_proto, sport, dport) -> rewrite to server
-    reverse flow : (server_ip, client_ip, l4_proto, dport, sport) -> rewrite back
-
-Both flows are installed with idle/hard timeouts and the SEND_FLOW_REM flag,
-so we get OFPFlowRemoved events from which we update per-server byte/packet
-counters and decrement the active-connection count.
-
-Periodically we also pull OFPFlowStats and OFPPortStats to refresh
-throughput/error metrics, and we log a metrics snapshot every few seconds.
-
-Validate from the mininet CLI with the helpers in scripts/test_lb.sh.
-"""
+# Ryu controller that implements the load balancer.
+# Listens for OpenFlow PacketIn events, picks a backend server using
+# the configured algorithm, and installs forward+reverse flow rules.
+# Set LB_ALGORITHM env var to choose the algorithm.
 
 from __future__ import annotations
 
@@ -44,9 +22,7 @@ from ryu.lib import hub
 from ryu.lib.packet import arp, ethernet, ether_types, icmp, ipv4, packet, tcp, udp
 from ryu.ofproto import ofproto_v1_3
 
-# Ryu loads this file by path, so `controller` isn't a package at runtime.
-# Make `metrics.py` importable whether we're loaded as a script (ryu-manager)
-# or as part of the `controller` package (pytest).
+# Ryu loads this as a script so `controller` isn't in sys.path by default.
 import os
 import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,6 +41,11 @@ try:
 except ImportError:  # pragma: no cover - exercised by ryu-manager
     from algorithms import get_algorithm, available_algorithms
 
+try:
+    from controller.traffic import classify_traffic, TrafficClass, DSCP
+except ImportError:  # pragma: no cover
+    from traffic import classify_traffic, TrafficClass, DSCP  # type: ignore
+
 
 # --- service configuration -------------------------------------------------
 
@@ -75,11 +56,12 @@ CLIENT_PORT = 1            # h1's switch port
 CLIENT_IP = "10.0.0.1"
 CLIENT_MAC = "00:00:00:00:00:01"
 
-# (name, switch_port, ip, mac, weight)
-# Weights are used by WeightedRoundRobin and LeastConnections/LRT normalisation.
-# Override via LB_WEIGHTS env var as comma-separated floats, e.g. "4,3,2,1"
-# Override server count via LB_NUM_SERVERS env var (default 3).
+# Server list. Override count and weights via env vars if needed.
+# e.g. LB_NUM_SERVERS=10 LB_WEIGHTS=16,16,...,4,4,...,1
 _num_servers = int(os.environ.get("LB_NUM_SERVERS", "3"))
+# servers start at the port after the last client
+_num_clients = int(os.environ.get("LB_NUM_CLIENTS", "1"))
+_server_port_offset = 1 + _num_clients   # switch port of the first server
 _default_weights = [max(1.0, float(_num_servers) - i) for i in range(_num_servers)]
 _env_weights = os.environ.get("LB_WEIGHTS", "")
 if _env_weights:
@@ -96,7 +78,7 @@ if _env_weights:
 BACKENDS = [
     (
         f"h{2 + i}",
-        2 + i,
+        _server_port_offset + i,   # may be corrected at switch-connect time
         f"10.0.0.{2 + i}",
         f"00:00:00:00:00:{2 + i:02x}",
         _default_weights[i],
@@ -104,23 +86,21 @@ BACKENDS = [
     for i in range(_num_servers)
 ]
 
-# Flow lifetimes
-# HTTP/1.0 connections close immediately after each response, so the flow
-# goes idle right away.  A 10-s idle timeout lets active_conns drain quickly
-# (important for least-connections accuracy) while still covering any
-# keep-alive or slow-response scenario.
-FLOW_IDLE_TIMEOUT = 2   # seconds — HTTP/1.0 closes after each response so the
-                        # flow goes idle immediately; 2 s gives OVS time to see
-                        # the FIN exchange before evicting the entry.
+# run_net_auto.py writes this file after starting the topology
+_PORTMAP_PATH = os.environ.get("LB_PORTMAP", "/tmp/lb_portmap.json")
+
+# flow timeouts - 2s idle is enough since HTTP/1.0 closes after each response
+FLOW_IDLE_TIMEOUT = 2
 FLOW_HARD_TIMEOUT = 60
+
+# all backends listen on 8000; the controller rewrites dst port for other VIP ports
+HTTP_BACKEND_PORT = int(os.environ.get("LB_BACKEND_PORT", "8000"))
 
 # Periodic stats poll interval
 STATS_INTERVAL_S = 3.0
 LOG_INTERVAL_S = 5.0
 
-# Where to write machine-readable metrics snapshots for offline analysis/plotting.
-# Each line is a JSON object: {"t": <monotonic_s>, "servers": [<snapshot>, ...]}.
-# Set to empty string to disable.
+# where to write per-event metrics for the plotting scripts
 METRICS_JSONL = os.environ.get("LB_METRICS_FILE", "/tmp/lb_metrics.jsonl")
 
 # Priorities
@@ -148,10 +128,7 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
         self.servers_by_ip = {s.ip: s for s in self.servers}
         self.servers_by_port = {s.port: s for s in self.servers}
 
-        # Pluggable load-balancing algorithm (strategy pattern). The active
-        # algorithm is chosen via the LB_ALGORITHM env var, defaulting to
-        # round robin. New algorithms register themselves in
-        # controller/algorithms/registry.py.
+        # pick the algorithm from env var, default to round_robin
         algo_name = os.environ.get("LB_ALGORITHM", DEFAULT_ALGORITHM)
         try:
             self._algorithm = get_algorithm(algo_name)
@@ -163,24 +140,22 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
             self._algorithm = get_algorithm(DEFAULT_ALGORITHM)
         self.logger.info("load-balancing algorithm: %s", self._algorithm.name)
 
-        # cookie -> ServerMetrics, used to credit FlowRemoved to the right server
-        # Forward and reverse flows each get their own cookie so FlowRemoved
-        # events are attributed correctly.
+        # cookie -> server so we know which server a FlowRemoved event belongs to
         self._cookie_to_server: dict[int, ServerMetrics] = {}
         self._next_cookie = 1
-        # Set of cookies belonging to REVERSE flows — used to avoid double-
-        # decrementing active_conns (we only credit the forward cookie).
+        # keep track of reverse flow cookies separately so we don't decrement active_conns twice
         self._reverse_cookies: set = set()
 
-        # Pending-flow cache: maps the 5-tuple that uniquely identifies a
-        # client connection to the (server, fwd_actions) already chosen for it.
-        # OVS takes a short but non-zero time to commit a FlowMod.  In that
-        # window the SYN, ACK, and first GET can all arrive as PacketIn events.
-        # Without this cache each would trigger a new server selection,
-        # sending successive packets of the SAME TCP connection to DIFFERENT
-        # backends — which breaks the TCP 3-way handshake.
-        # Entry format: (src_ip, proto, src_port, dst_port) -> (server, [actions])
+        # OVS takes ~1ms to install flows, so multiple PacketIn events can arrive
+        # for the same connection before the rule is in. Cache the first pick.
         self._pending_flows: dict = {}
+
+        # remember each client's MAC and switch port for fallback rewrites
+        self._client_info: dict = {}
+
+        # remember the original VIP port per connection so we can restore it
+        # in response packets when the VIP port != HTTP_BACKEND_PORT
+        self._srv_to_vip: dict = {}
 
         # background pollers
         self._stats_thread = hub.spawn(self._stats_loop)
@@ -198,13 +173,52 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
     # ------------------------------------------------------------------
     # Switch lifecycle
     # ------------------------------------------------------------------
+    def _deferred_portmap_apply(self):
+        """Sleep a bit then load the portmap so the file is ready."""
+        hub.sleep(2.0)
+        self._apply_portmap()
+
+    def _apply_portmap(self):
+        """Read the portmap written by run_net_auto.py and fix server port numbers.
+        OVS doesn't always assign ports in order, so we need this.
+        """
+        try:
+            with open(_PORTMAP_PATH) as f:
+                portmap = json.load(f)
+        except FileNotFoundError:
+            self.logger.info("no portmap at %s — using sequential offset=%d",
+                             _PORTMAP_PATH, _server_port_offset)
+            return
+        except Exception as exc:
+            self.logger.warning("portmap load error: %s", exc)
+            return
+
+        changed = 0
+        for srv in self.servers:
+            real_port = portmap.get(srv.name)
+            if real_port is not None and int(real_port) != srv.port:
+                self.logger.info("portmap: %s port %d → %d",
+                                 srv.name, srv.port, int(real_port))
+                self.servers_by_port.pop(srv.port, None)
+                srv.port = int(real_port)
+                changed += 1
+        # Rebuild servers_by_port with corrected ports.
+        if changed:
+            self.servers_by_port = {s.port: s for s in self.servers}
+            self.logger.info("portmap applied: %d server port(s) updated", changed)
+        else:
+            self.logger.info("portmap applied: all ports already correct")
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def _features_handler(self, ev):
         dp = ev.msg.datapath
         self.datapaths[dp.id] = dp
         ofp, parser = dp.ofproto, dp.ofproto_parser
 
-        # table-miss -> controller
+        # load the portmap after a short delay so the file is ready
+        hub.spawn(self._deferred_portmap_apply)
+
+        # table-miss rule - send unknown packets to the controller
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER,
                                           ofp.OFPCML_NO_BUFFER)]
@@ -250,8 +264,8 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
     # ------------------------------------------------------------------
     # Backend selection (delegates to the configured algorithm)
     # ------------------------------------------------------------------
-    def _select_server(self) -> ServerMetrics:
-        return self._algorithm.select(self.servers)
+    def _select_server(self, traffic_class: str = "http") -> ServerMetrics:
+        return self._algorithm.select(self.servers, traffic_class)
 
     # ------------------------------------------------------------------
     # PacketIn
@@ -292,7 +306,7 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
                 # Detect it by checking whether the source is a known backend
                 # and forward it with the VIP rewrite applied directly.
                 srv = self.servers_by_ip.get(ip4.src)
-                if srv is not None and ip4.dst == CLIENT_IP:
+                if srv is not None and ip4.dst in self._client_info:
                     self._handle_server_to_client(dp, in_port, msg, eth, ip4, srv)
                     return
 
@@ -324,21 +338,29 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
 
     # ------------------------------------------------------------------
     def _handle_server_to_client(self, dp, in_port, msg, eth, ip4, srv):
-        """Forward a server->client packet that missed the reverse flow rule.
-
-        This covers the race where the SYN-ACK (or any early response packet)
-        reaches the controller before OVS has committed the reverse FlowMod.
-        We apply the VIP rewrite inline and forward the packet directly.
+        """Handle a server->client packet that arrived before the flow rule was installed.
+        Just apply the VIP rewrite and forward it manually.
         """
         parser = dp.ofproto_parser
         ofp = dp.ofproto
 
+        client_mac, client_port = self._client_info.get(
+            ip4.dst, (CLIENT_MAC, CLIENT_PORT)
+        )
         actions = [
             parser.OFPActionSetField(eth_src=VMAC),
-            parser.OFPActionSetField(eth_dst=CLIENT_MAC),
+            parser.OFPActionSetField(eth_dst=client_mac),
             parser.OFPActionSetField(ipv4_src=VIP),
-            parser.OFPActionOutput(CLIENT_PORT),
         ]
+        # restore the original VIP port in the response if needed
+        if ip4.proto == 6:
+            pkt_fb = packet.Packet(msg.data)
+            tcp_fb = pkt_fb.get_protocol(tcp.tcp)
+            if tcp_fb:
+                vip_port = self._srv_to_vip.get((srv.ip, ip4.dst, tcp_fb.dst_port))
+                if vip_port and vip_port != HTTP_BACKEND_PORT:
+                    actions.append(parser.OFPActionSetField(tcp_src=vip_port))
+        actions.append(parser.OFPActionOutput(client_port))
         # Always use inline data — avoids OVS buffer expiry race.
         out = parser.OFPPacketOut(
             datapath=dp,
@@ -361,33 +383,32 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
         client_src_port = 0
         server_dst_port = 0
 
+        tc = TrafficClass.HTTP
         if proto == 6:  # TCP
             t = pkt.get_protocol(tcp.tcp)
             if t is None:
                 return
             client_src_port = t.src_port
             server_dst_port = t.dst_port
+            tc = classify_traffic(server_dst_port, proto=6)
             l4_match = {"ip_proto": 6, "tcp_src": t.src_port, "tcp_dst": t.dst_port}
-            l4_rev = {"ip_proto": 6, "tcp_src": t.dst_port, "tcp_dst": t.src_port}
+            l4_rev = {"ip_proto": 6, "tcp_src": HTTP_BACKEND_PORT, "tcp_dst": t.src_port}
         elif proto == 17:  # UDP
             u = pkt.get_protocol(udp.udp)
             if u is None:
                 return
             client_src_port = u.src_port
             server_dst_port = u.dst_port
+            tc = classify_traffic(server_dst_port, proto=17)
             l4_match = {"ip_proto": 17, "udp_src": u.src_port, "udp_dst": u.dst_port}
-            l4_rev = {"ip_proto": 17, "udp_src": u.dst_port, "udp_dst": u.src_port}
+            l4_rev = {"ip_proto": 17, "udp_src": HTTP_BACKEND_PORT, "udp_dst": u.src_port}
         elif proto == 1:  # ICMP — no port concept, use broad match
             l4_match = {"ip_proto": 1}
             l4_rev = {"ip_proto": 1}
         else:
             return  # don't load-balance unknown L4
 
-        # ── Deduplication: OVS takes ~1 ms to commit a FlowMod.  In that
-        # window the SYN, ACK, and first data segment can all arrive as
-        # PacketIn.  Re-use the server we already picked for this 5-tuple
-        # instead of selecting a new one (which would route successive TCP
-        # segments to DIFFERENT backends and break the handshake).
+        # check if we already picked a server for this flow
         flow_key = (ip4.src, proto, client_src_port, server_dst_port)
         if flow_key in self._pending_flows:
             srv, fwd_actions = self._pending_flows[flow_key]
@@ -405,18 +426,19 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
             dp.send_msg(out)
             return
 
-        srv = self._select_server()
+        # learn this client's MAC and port
+        if ip4.src not in self._client_info:
+            self._client_info[ip4.src] = (eth.src, in_port)
+            self.logger.info("new client: %s  mac=%s  port=%d", ip4.src, eth.src, in_port)
+
+        srv = self._select_server(tc)
         srv.on_selected()
         self._algorithm.on_selected(srv)
 
-        # Allocate separate cookies for forward and reverse flows so
-        # FlowRemoved events from either direction can be attributed.
         fwd_cookie = self._alloc_cookie(srv)
         rev_cookie = self._alloc_cookie(srv)
         self._reverse_cookies.add(rev_cookie)
 
-        # Enqueue this request in the server's per-server queue so that
-        # metrics and future algorithms can inspect / manage it.
         srv.enqueue_request(RequestEntry(
             cookie=fwd_cookie,
             ts=time.monotonic(),
@@ -424,11 +446,13 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
             client_src_port=client_src_port,
             server_dst_port=server_dst_port,
             dispatched=True,
+            client_ip=ip4.src,
+            traffic_class=tc,
         ))
 
         self.logger.info(
-            "LB: %s:%s -> %s  picked %s (score=%.3f, active=%d, queue=%d, w=%.1f)",
-            ip4.src, client_src_port or "*", VIP,
+            "LB [%s]: %s:%s -> %s  picked %s (score=%.3f, active=%d, queue=%d, w=%.1f)",
+            tc, ip4.src, client_src_port or "*", VIP,
             srv.name, srv.score(), srv.active_conns, srv.queue_depth, srv.weight,
         )
         if self._metrics_fh is not None:
@@ -436,6 +460,7 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
                 rec = json.dumps({
                     "event": "select",
                     "t": round(time.monotonic(), 3),
+                    "traffic_class": tc,
                     "server": srv.name,
                     "client_port": client_src_port,
                     "proto": proto,
@@ -448,7 +473,7 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
             except OSError:
                 pass
 
-        # ----- forward: client -> VIP becomes client -> server ----------
+        # forward rule: rewrite VIP -> real server address
         fwd_match = parser.OFPMatch(
             in_port=in_port,
             eth_type=ether_types.ETH_TYPE_IP,
@@ -457,18 +482,23 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
             **l4_match,
         )
         fwd_actions = [
+            parser.OFPActionSetField(ip_dscp=DSCP.get(tc, 0)),
             parser.OFPActionSetField(eth_src=VMAC),
             parser.OFPActionSetField(eth_dst=srv.mac),
             parser.OFPActionSetField(ipv4_dst=srv.ip),
-            parser.OFPActionOutput(srv.port),
         ]
+        if proto == 6 and server_dst_port != HTTP_BACKEND_PORT:
+            fwd_actions.append(parser.OFPActionSetField(tcp_dst=HTTP_BACKEND_PORT))
+        elif proto == 17 and server_dst_port != HTTP_BACKEND_PORT:
+            fwd_actions.append(parser.OFPActionSetField(udp_dst=HTTP_BACKEND_PORT))
+        fwd_actions.append(parser.OFPActionOutput(srv.port))
         self._add_flow(dp, PRIO_LB, fwd_match, fwd_actions,
                        idle_timeout=FLOW_IDLE_TIMEOUT,
                        hard_timeout=FLOW_HARD_TIMEOUT,
                        cookie=fwd_cookie,
                        flags=ofp.OFPFF_SEND_FLOW_REM)
 
-        # ----- reverse: server -> client becomes VIP -> client ----------
+        # reverse rule: rewrite server address back to VIP
         rev_match = parser.OFPMatch(
             eth_type=ether_types.ETH_TYPE_IP,
             ipv4_src=srv.ip,
@@ -479,20 +509,25 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
             parser.OFPActionSetField(eth_src=VMAC),
             parser.OFPActionSetField(eth_dst=eth.src),
             parser.OFPActionSetField(ipv4_src=VIP),
-            parser.OFPActionOutput(in_port),
         ]
+        if proto == 6 and server_dst_port != HTTP_BACKEND_PORT:
+            rev_actions.append(parser.OFPActionSetField(tcp_src=server_dst_port))
+        elif proto == 17 and server_dst_port != HTTP_BACKEND_PORT:
+            rev_actions.append(parser.OFPActionSetField(udp_src=server_dst_port))
+        rev_actions.append(parser.OFPActionOutput(in_port))
+
+        # remember which VIP port was used so the fallback can restore it
+        if proto in (6, 17) and server_dst_port != HTTP_BACKEND_PORT:
+            self._srv_to_vip[(srv.ip, ip4.src, client_src_port)] = server_dst_port
         self._add_flow(dp, PRIO_LB, rev_match, rev_actions,
                        idle_timeout=FLOW_IDLE_TIMEOUT,
                        hard_timeout=FLOW_HARD_TIMEOUT,
                        cookie=rev_cookie,
                        flags=ofp.OFPFF_SEND_FLOW_REM)
 
-        # Cache this 5-tuple so duplicate PacketIn events (SYN retransmits,
-        # ACK, first GET arriving before FlowMod is committed) are handled
-        # correctly without re-selecting a server.
         self._pending_flows[flow_key] = (srv, fwd_actions)
 
-        # ---- send the trigger packet through the freshly installed flow.
+        # send the packet that triggered this PacketIn through the new rule
         out = parser.OFPPacketOut(
             datapath=dp,
             buffer_id=ofp.OFP_NO_BUFFER,
@@ -520,7 +555,6 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
             self._add_flow(dp, PRIO_L2, match, actions,
                            idle_timeout=FLOW_IDLE_TIMEOUT)
 
-        # Always use inline data — avoids OVS buffer expiry race.
         out = parser.OFPPacketOut(datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
                                   in_port=in_port, actions=actions, data=msg.data)
         dp.send_msg(out)
@@ -542,9 +576,6 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply(self, ev):
-        # Sum live byte/packet counts of currently-installed forward flows
-        # per server. We only refresh the per-server "live throughput" view;
-        # cumulative totals are advanced on FlowRemoved.
         live_bytes = {s.ip: 0 for s in self.servers}
         live_packets = {s.ip: 0 for s in self.servers}
         for st in ev.msg.body:
@@ -553,8 +584,6 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
                 continue
             live_bytes[srv.ip] += st.byte_count
             live_packets[srv.ip] += st.packet_count
-        # surface as transient counters (not added to total_*; those are
-        # incremented in on_flow_removed to avoid double-counting)
         for s in self.servers:
             s._live_bytes = live_bytes[s.ip]      # type: ignore[attr-defined]
             s._live_packets = live_packets[s.ip]  # type: ignore[attr-defined]
@@ -585,24 +614,21 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
         duration = msg.duration_sec + msg.duration_nsec / 1e9
 
         if is_reverse:
-            # Reverse flow expired — just remove from cookie map; the forward
-            # flow's removal is the authoritative event for metrics and queue.
             self.logger.debug(
                 "rev-flow removed: %s  bytes=%d pkts=%d dur=%.2fs",
                 srv.name, msg.byte_count, msg.packet_count, duration,
             )
             return
 
-        # Forward flow removed — credit the server and update the queue.
         srv.on_flow_removed(byte_count=msg.byte_count,
                             packet_count=msg.packet_count,
                             duration_s=duration)
         entry = srv.dequeue_request(msg.cookie)
-        # Remove from pending-flow cache so a future connection reusing the
-        # same ephemeral port gets a fresh server selection.
         if entry is not None:
-            flow_key = (CLIENT_IP, entry.proto, entry.client_src_port, entry.server_dst_port)
+            flow_key = (entry.client_ip or CLIENT_IP, entry.proto, entry.client_src_port, entry.server_dst_port)
             self._pending_flows.pop(flow_key, None)
+            if entry.proto in (6, 17) and entry.server_dst_port != HTTP_BACKEND_PORT:
+                self._srv_to_vip.pop((srv.ip, entry.client_ip, entry.client_src_port), None)
         self._algorithm.on_flow_removed(srv)
         self.logger.info(
             "flow removed: %s  bytes=%d pkts=%d dur=%.2fs  active->%d queue->%d",
@@ -629,8 +655,7 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
     # Periodic logging
     # ------------------------------------------------------------------
     def _log_loop(self):
-        # let the switch connect first
-        hub.sleep(LOG_INTERVAL_S)
+        hub.sleep(LOG_INTERVAL_S)  # wait for the switch to connect first
         t0 = time.monotonic()
         while True:
             snaps = [s.snapshot() for s in self.servers]
