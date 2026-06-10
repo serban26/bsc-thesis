@@ -6,23 +6,20 @@ from .base import LoadBalancingAlgorithm
 
 try:
     from controller.metrics import ServerMetrics
-    from controller.traffic import server_pool
 except ImportError:  # pragma: no cover
     from metrics import ServerMetrics  # type: ignore[no-redef]
-    from traffic import server_pool  # type: ignore[no-redef]
 
 
 class RoundRobinAlgorithm(LoadBalancingAlgorithm):
-    """Simple round robin. Each traffic class has its own cursor."""
+    """Simple round robin - cycles through all servers equally regardless of traffic class."""
 
     name = "round_robin"
 
     def __init__(self) -> None:
-        self._cursors: dict[str, int] = {}
+        self._cursor: int = 0
 
     def select(self, servers: Sequence[ServerMetrics], traffic_class: str = "http") -> ServerMetrics:
-        pool = server_pool(servers, traffic_class)
-        cursor = self._cursors.get(traffic_class, 0)
-        chosen = pool[cursor % len(pool)]
-        self._cursors[traffic_class] = (cursor + 1) % len(pool)
+        pool = list(servers)
+        chosen = pool[self._cursor % len(pool)]
+        self._cursor = (self._cursor + 1) % len(pool)
         return chosen

@@ -1,6 +1,3 @@
-# Keeps track of per-server stats: active connections, bytes transferred,
-# average response time etc. Used by the load balancing algorithms.
-
 from __future__ import annotations
 
 import time
@@ -8,14 +5,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
-_EWMA_ALPHA = 0.3  # EWMA smoothing factor
+_EWMA_ALPHA = 0.15  # 15% weight on each new sample
 
 
 @dataclass
 class RequestEntry:
     """One in-flight request."""
     cookie: int
-    ts: float             # when the request was dispatched
+    ts: float
     proto: int            # 6=TCP, 17=UDP
     client_src_port: int = 0
     server_dst_port: int = 0
@@ -48,7 +45,6 @@ class ServerMetrics:
     _last_conn_ts: float = field(default_factory=time.monotonic)
     selections_total: int = 0
 
-    # queue of in-flight requests for this server
     _pending_queue: deque = field(default_factory=deque, repr=False)
 
     def enqueue_request(self, entry: RequestEntry) -> None:
@@ -66,7 +62,6 @@ class ServerMetrics:
         return len(self._pending_queue)
 
     def on_selected(self) -> None:
-        """Increment counters when this server gets a new connection."""
         self.active_conns += 1
         self.selections_total += 1
 
@@ -80,7 +75,6 @@ class ServerMetrics:
 
     def on_flow_removed(self, byte_count: int, packet_count: int,
                         duration_s: float) -> None:
-        """Update stats when a flow expires."""
         self.active_conns = max(0, self.active_conns - 1)
         self.total_bytes += byte_count
         self.total_packets += packet_count
@@ -93,7 +87,6 @@ class ServerMetrics:
     def on_port_stats(self, tx_bytes: int, rx_bytes: int,
                       tx_errors: int, rx_errors: int,
                       tx_dropped: int, rx_dropped: int) -> None:
-        """Update throughput and error counts from the periodic port stats poll."""
         now = time.monotonic()
         dt = max(now - self._last_port_ts, 1e-3)
         total = tx_bytes + rx_bytes
@@ -110,9 +103,9 @@ class ServerMetrics:
         c2 = 0.5  * self.queue_depth / w
         c3 = 0.3  * (self.throughput_bps / 10_000_000.0) / w
         c4 = 0.2  * self.conn_rate_eps / w
-        c5 = 2.0  * self.port_errors          # health penalty
+        c5 = 2.0  * self.port_errors
         c6 = 0.2  * self.avg_flow_dur_s
-        c7 = 0.01 * self.selections_total / w  # slight fairness tie-break
+        c7 = 0.01 * self.selections_total / w
         return c1 + c2 + c3 + c4 + c5 + c6 + c7
 
     def snapshot(self) -> dict:

@@ -52,8 +52,8 @@ import shutil
 
 _SCRIPT_DIR = "/tmp/lb_servers"
 
-# server tiers: A=fast (first 40%), B=medium (next 30%), C=slow (next 20%), D=legacy (last 10%)
-_TIER_THRESHOLDS = (0.40, 0.70, 0.90)   # A<40% ≤ B<70% ≤ C<90% ≤ D
+# server tiers: A=fast (first 20%), B=medium (next 30%), C=slower (next 30%), D=legacy (last 20%)
+_TIER_THRESHOLDS = (0.20, 0.50, 0.80)   # A<20% ≤ B<50% ≤ C<80% ≤ D
 
 _TIER_PARAMS = {
     #       base latency (ms)        jitter (ms)          spike   error  concurrency       spike behaviour

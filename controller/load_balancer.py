@@ -1,7 +1,5 @@
-# Ryu controller that implements the load balancer.
-# Listens for OpenFlow PacketIn events, picks a backend server using
-# the configured algorithm, and installs forward+reverse flow rules.
-# Set LB_ALGORITHM env var to choose the algorithm.
+# SDN load balancer — intercepts new TCP connections, picks a backend,
+# installs a forward+reverse flow pair. Set LB_ALGORITHM to switch algorithms.
 
 from __future__ import annotations
 
@@ -23,8 +21,6 @@ from ryu.lib.packet import arp, ethernet, ether_types, icmp, ipv4, packet, tcp, 
 from ryu.ofproto import ofproto_v1_3
 
 # Ryu loads this as a script so `controller` isn't in sys.path by default.
-import os
-import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
@@ -128,7 +124,6 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
         self.servers_by_ip = {s.ip: s for s in self.servers}
         self.servers_by_port = {s.port: s for s in self.servers}
 
-        # pick the algorithm from env var, default to round_robin
         algo_name = os.environ.get("LB_ALGORITHM", DEFAULT_ALGORITHM)
         try:
             self._algorithm = get_algorithm(algo_name)
@@ -161,7 +156,6 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
         self._stats_thread = hub.spawn(self._stats_loop)
         self._log_thread = hub.spawn(self._log_loop)
 
-        # Open the JSONL metrics file for writing (truncate on start).
         self._metrics_fh = None
         if METRICS_JSONL:
             try:
@@ -174,14 +168,11 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
     # Switch lifecycle
     # ------------------------------------------------------------------
     def _deferred_portmap_apply(self):
-        """Sleep a bit then load the portmap so the file is ready."""
         hub.sleep(2.0)
         self._apply_portmap()
 
     def _apply_portmap(self):
-        """Read the portmap written by run_net_auto.py and fix server port numbers.
-        OVS doesn't always assign ports in order, so we need this.
-        """
+        """OVS doesn't assign ports in order; this corrects them from the portmap."""
         try:
             with open(_PORTMAP_PATH) as f:
                 portmap = json.load(f)
@@ -215,7 +206,6 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
         self.datapaths[dp.id] = dp
         ofp, parser = dp.ofproto, dp.ofproto_parser
 
-        # load the portmap after a short delay so the file is ready
         hub.spawn(self._deferred_portmap_apply)
 
         # table-miss rule - send unknown packets to the controller
@@ -262,7 +252,7 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
         return c
 
     # ------------------------------------------------------------------
-    # Backend selection (delegates to the configured algorithm)
+    # Backend selection
     # ------------------------------------------------------------------
     def _select_server(self, traffic_class: str = "http") -> ServerMetrics:
         return self._algorithm.select(self.servers, traffic_class)
@@ -338,9 +328,7 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
 
     # ------------------------------------------------------------------
     def _handle_server_to_client(self, dp, in_port, msg, eth, ip4, srv):
-        """Handle a server->client packet that arrived before the flow rule was installed.
-        Just apply the VIP rewrite and forward it manually.
-        """
+        """VIP rewrite fallback for packets that arrive before the FlowMod commits."""
         parser = dp.ofproto_parser
         ofp = dp.ofproto
 
@@ -527,7 +515,6 @@ class AdaptiveLoadBalancer(app_manager.RyuApp):
 
         self._pending_flows[flow_key] = (srv, fwd_actions)
 
-        # send the packet that triggered this PacketIn through the new rule
         out = parser.OFPPacketOut(
             datapath=dp,
             buffer_id=ofp.OFP_NO_BUFFER,

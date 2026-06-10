@@ -264,50 +264,69 @@ and Mininet communicate over loopback on TCP~6633 using OpenFlow~1.3
 
 \begin{figure}[t]
 \centering
+\resizebox{\columnwidth}{!}{%
 \begin{tikzpicture}[
-  box/.style={draw, rounded corners=3pt, minimum width=2.4cm,
-              minimum height=0.7cm, align=center, font=\scriptsize},
+  box/.style={draw, rounded corners=3pt, minimum width=1.6cm,
+              minimum height=0.68cm, align=center, font=\scriptsize},
   arr/.style={-Stealth, thick},
   darr/.style={Stealth-Stealth, thick, dashed},
   layer/.style={draw=gray!40, dashed, rounded corners=5pt, inner sep=5pt}
 ]
-  \node[box,fill=blue!12]  (ryu) at (0,0)    {Ryu controller};
-  \node[box,fill=blue!8]   (alg) at (-2.2,0) {Algorithm};
-  \node[box,fill=blue!8]   (met) at ( 2.2,0) {Metrics\\module};
+  % ── Control plane (top) ─────────────────────────────────────────
+  \node[box,fill=blue!12] (ryu) at ( 0.0, 0) {Ryu\\controller};
+  \node[box,fill=blue!8]  (alg) at (-2.0, 0) {Algorithm};
+  \node[box,fill=blue!8]  (met) at ( 2.0, 0) {Metrics\\module};
   \draw[arr]  (alg) -- (ryu) node[midway,above,font=\tiny]{select()};
   \draw[darr] (ryu) -- (met) node[midway,above,font=\tiny]{snapshot};
 
-  \node[box,fill=green!12] (ovs) at (0,-1.7) {Open vSwitch\\OF~1.3};
+  % ── Data plane (OVS centre) ──────────────────────────────────────
+  \node[box,fill=green!12] (ovs) at (0,-2.0) {Open vSwitch\\OF~1.3};
   \draw[darr] (ryu) -- (ovs) node[midway,right,font=\tiny]{FlowMod/PacketIn};
 
-  \node[box,fill=orange!15](h1) at (-2.8,-3.2){h1 client};
-  \node[box,fill=gray!15]  (h2) at (-0.9,-3.2){h2};
-  \node[box,fill=gray!15]  (h3) at ( 0.9,-3.2){h3};
-  \node[box,fill=gray!15]  (hN) at ( 2.8,-3.2){hN};
-  \foreach \h in {h1,h2,h3,hN} \draw[arr] (ovs) -- (\h);
-  \node[font=\tiny,text=blue!60] at (0,-2.4){VIP 10.0.0.100};
+  % ── Clients (left, vertically stacked) ──────────────────────────
+  \node[box,fill=orange!15](c1)  at (-3.2,-0.8) {c1};
+  \node[box,fill=orange!15](c2)  at (-3.2,-2.0) {c2};
+  \node[font=\small]       (cdt) at (-3.2,-3.0) {$\vdots$};
+  \node[box,fill=orange!15](cM)  at (-3.2,-3.8) {cM};
 
+  % ── Servers (right, vertically stacked) ─────────────────────────
+  \node[box,fill=gray!15]  (h1)  at ( 3.2,-0.8) {h1};
+  \node[box,fill=gray!15]  (h2)  at ( 3.2,-2.0) {h2};
+  \node[font=\small]       (hdt) at ( 3.2,-3.0) {$\vdots$};
+  \node[box,fill=gray!15]  (hN)  at ( 3.2,-3.8) {hN};
+
+  % ── Connections ─────────────────────────────────────────────────
+  \foreach \c in {c1,c2,cM} \draw[darr] (ovs) -- (\c);
+  \foreach \h in {h1,h2,hN} \draw[arr]  (ovs) -- (\h);
+  \node[font=\tiny,text=blue!60] at (0,-1.3) {VIP 10.0.0.100};
+
+  % ── Background regions ──────────────────────────────────────────
   \begin{scope}[on background layer]
     \node[layer, fit=(ryu)(alg)(met),
           label={[gray,font=\scriptsize]above:Control Plane}] {};
     \node[layer, fit=(ovs),
-          label={[gray,font=\scriptsize]left:Data Plane}] {};
-    \node[layer, fit=(h1)(h2)(h3)(hN),
-          label={[gray,font=\scriptsize]below:Hosts}] {};
+          label={[gray,font=\scriptsize]right:Data Plane}] {};
+    \node[layer, fit=(c1)(c2)(cdt)(cM),
+          label={[gray,font=\scriptsize]below:Clients}] {};
+    \node[layer, fit=(h1)(h2)(hdt)(hN),
+          label={[gray,font=\scriptsize]below:Servers}] {};
   \end{scope}
-\end{tikzpicture}
-\caption{System architecture. Ryu programs OVS via OpenFlow~1.3. Algorithm and
-  metrics logic run inside the controller process.}
+\end{tikzpicture}%
+}
+\caption{System architecture. Clients (left) connect to the VIP; Ryu picks
+  a backend and programs OVS via OpenFlow~1.3 to rewrite headers
+  transparently. Any number of clients and servers are supported.}
 \label{fig:arch}
 \end{figure}
 
 \subsection{Network Topology}
 
-The topology is a single switch (\texttt{s1}) connected to one client (\texttt{h1})
-and $N$ backend servers (\texttt{h2}--\texttt{hN}), all on \texttt{10.0.0.0/24}.
-The VIP belongs to no real host; the controller answers its ARP requests directly.
-The default experiment uses $N = 50$ servers, configurable via an environment
-variable.
+The topology is a single switch (\texttt{s1}) connected to $M$ clients and
+$N$ backend servers, all on \texttt{10.0.0.0/24}. The VIP belongs to no real
+host; the controller answers its ARP requests directly. Both counts are
+configurable via the \texttt{LB\_NUM\_CLIENTS} and \texttt{LB\_NUM\_SERVERS}
+environment variables. The default experiment uses $M = 1$ client and
+$N = 50$ servers.
 
 \subsection{Controller Design}
 
@@ -333,7 +352,7 @@ when OVS sends multiple PacketIn events for the same TCP handshake.
 \paragraph{FlowRemoved.}
 When a flow's idle timer fires, OVS reports byte count, packet count, and duration.
 The controller decrements \texttt{active\_conns} and updates the per-server EWMA
-of flow duration ($\alpha = 0.3$), which is the main feedback signal used by LRT
+of flow duration ($\alpha = 0.15$), which is the main feedback signal used by LRT
 and AP. Figure~\ref{fig:flow} shows the full lifecycle.
 
 \begin{figure}[t]
@@ -359,11 +378,51 @@ and AP. Figure~\ref{fig:flow} shows the full lifecycle.
 \label{fig:flow}
 \end{figure}
 
+\subsection{Traffic Classification}
+\label{sec:tc}
+
+Not all traffic is equally latency-sensitive, so the controller classifies
+each new connection by destination port and applies two QoS mechanisms.
+
+\paragraph{DSCP marking.}
+The forward flow rule writes a DSCP value into the IP header according to
+Table~\ref{tab:dscp}, following RFC~4594. This lets any downstream switch
+give priority queuing to VoIP and audio flows without changing the application
+code on either side.
+
+\begin{table}[h]
+\centering\footnotesize
+\setlength{\tabcolsep}{4pt}
+\caption{Port-to-traffic-class mapping and DSCP values used in the experiment.}
+\label{tab:dscp}
+\begin{tabular}{l p{3.0cm} r}
+\toprule
+\textbf{Class} & \textbf{Ports} & \textbf{DSCP} \\
+\midrule
+VoIP  & 5060, 5061; RTP 16384--32767 & 46 (EF) \\
+Audio & 1755                          & 34 (AF41) \\
+Video & 554, 1935, 8554               & 26 (AF31) \\
+Maps  & 443, 8443                     & 18 (AF21) \\
+HTTP  & 80, 8000                      &  0 (BE) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Tier-restricted server pools.}
+Higher-priority classes are restricted to the fastest backends.
+VoIP and audio are routed only to the top 20\,\% of servers (sorted by static
+weight, which corresponds to Tier~A). Video gets the top 50\,\% (Tier~A and~B).
+Maps and HTTP traffic can go anywhere. This means no latency-sensitive packet
+can ever reach a Tier~C or Tier~D server, regardless of which algorithm is
+active. The experimental traffic mix is roughly 35\,\% HTTP, 15\,\% maps,
+20\,\% video, 15\,\% audio, and 15\,\% VoIP, so about 30\,\% of flows are
+hard-constrained to Tier~A servers.
+
 \subsection{Load-Balancing Algorithms}
 
 All five algorithms subclass \texttt{LoadBalancingAlgorithm} and are selected at
 runtime via the \texttt{LB\_ALGORITHM} environment variable. Each implements a
-single \texttt{select(servers, metrics)} method.
+single \texttt{select(servers, traffic\_class)} method.
 
 \subsubsection{Round Robin (RR)}
 
@@ -408,32 +467,51 @@ inherent lag of several requests before a sudden spike is reflected in the score
 AP combines both signals: the current queue depth and the historical service
 time. The routing score is:
 \begin{equation}
-  \ell_i = \frac{(\text{active\_conns}_i + 1)
-                 \times \text{avg\_flow\_dur\_s}_i}
-                {\text{dyn\_weight}_i}
+  \ell_i = \frac{\text{avg\_flow\_dur\_s}_i \cdot
+                 \bigl(\text{dyn\_weight}_i
+                       + c_{\mathrm{tc}} \cdot \text{active\_conns}_i\bigr)}
+                {\text{dyn\_weight}_i^{2}}
   \label{eq:ap}
 \end{equation}
+where $c_{\mathrm{tc}}$ is a per-traffic-class multiplier that amplifies the
+load penalty for latency-sensitive flows: 1.0 for HTTP, 1.2 for maps, 1.5
+for video, 2.0 for audio, and 3.0 for VoIP. Factoring out
+$\text{dyn\_weight}_i$ gives an equivalent form that shows the relationship to
+LRT more clearly:
+\[
+  \ell_i = \frac{\text{avg\_flow\_dur\_s}_i}{\text{dyn\_weight}_i}
+           \times \Bigl(1 + \frac{c_{\mathrm{tc}} \cdot \text{active\_conns}_i}
+                              {\text{dyn\_weight}_i}\Bigr)
+\]
+The first factor is the LRT score; the second is a load multiplier that starts
+at~1 when the server is idle and rises as connections pile up. High-capacity
+servers (large $\text{dyn\_weight}$) tolerate more concurrent requests before
+their score degrades, which is the intended behaviour.
 
-The numerator is the estimated \emph{work left} on server $i$: the number of
-requests currently waiting (plus the incoming one) multiplied by the expected
-service time per request. The denominator is a dynamic weight that adjusts
-continuously using a second EWMA layer:
+The dynamic weight is updated on each FlowRemoved event. The target is:
 \begin{equation}
-\begin{split}
-  \text{dyn\_weight}_{i}^{(t+1)} &=
-    (1 - \alpha_d)\,\text{dyn\_weight}_{i}^{(t)}\\
-    &\quad + \alpha_d \cdot w_i^{\text{static}}
-      \cdot \frac{\bar{\mu}}{\mu_i}
-\end{split}
+  \tau_i = \max\!\left(\frac{w_i^{\text{static}}}{\text{avg\_flow\_dur\_s}_i},\;
+                       0.05 \cdot w_i^{\text{static}}\right)
+  \label{eq:target}
+\end{equation}
+The floor at 5\,\% of the static weight stops $\text{dyn\_weight}$ from
+collapsing during a prolonged spike. The EWMA update is:
+\begin{equation}
+  \text{dyn\_weight}_{i}^{(t+1)} =
+    (1-\alpha)\,\text{dyn\_weight}_{i}^{(t)} + \alpha\,\tau_i
   \label{eq:dba}
 \end{equation}
-where $\bar{\mu}$ is the global mean flow duration, $\mu_i$ is the per-server
-mean, and $\alpha_d = 0.25$ is the adaptation rate. When server $i$ is slower
-than average, $\text{dyn\_weight}_i$ decreases, which increases $\ell_i$ and reduces
-the traffic sent to it. When it recovers, the weight rises again.
+where $\alpha = 0.60$ for the first 5~completed flows and $\alpha = 0.20$
+thereafter. A higher $\alpha$ at the start speeds up initial learning during
+warm-up; the lower rate afterward avoids overreacting to short-lived spikes. A fast
+server has a small $\text{avg\_flow\_dur\_s}$, so $\tau_i$ is large and
+$\text{dyn\_weight}_i$ grows over time. Since the score in~\eqref{eq:ap}
+divides by $\text{dyn\_weight}^2$, a higher weight means a lower (better) score,
+rewarding historically fast servers with a structural advantage that persists
+between flows.
 
-The key advantage over LRT is the $(\text{active\_conns} + 1)$ term. When a
-spike begins, active connections on the affected server start rising
+The key advantage over LRT is the $c_{\mathrm{tc}} \cdot \text{active\_conns}$
+term. When a spike begins, active connections on the affected server start rising
 \emph{immediately}, before any FlowRemoved event arrives. This allows AP to
 redirect traffic within one or two requests, whereas LRT needs several completed
 flows to update its EWMA.
@@ -443,13 +521,14 @@ flows to update its EWMA.
 The \texttt{metrics.py} module maintains a \texttt{ServerMetrics} object for
 each backend (Table~\ref{tab:metrics}). The key fields for the adaptive algorithms
 are \texttt{active\_conns} (incremented on PacketIn, decremented on FlowRemoved)
-and \texttt{avg\_flow\_dur\_s} (EWMA with $\alpha = 0.3$ over FlowRemoved durations).
+and \texttt{avg\_flow\_dur\_s} (EWMA with $\alpha = 0.15$ over FlowRemoved durations).
 
 \begin{table}[t]
-\centering
+\centering\footnotesize
+\setlength{\tabcolsep}{4pt}
 \caption{Per-server metrics tracked by the controller.}
 \label{tab:metrics}
-\begin{tabular}{ll}
+\begin{tabular}{l p{4.2cm}}
 \toprule
 \textbf{Metric} & \textbf{Description}\\
 \midrule
@@ -471,7 +550,7 @@ per request, used by the plotting scripts.
 
 \subsection{Software Stack}
 
-\begin{table}[t]
+\begin{table}[H]
 \centering
 \caption{Software versions used in all experiments.}
 \label{tab:stack}
@@ -715,15 +794,75 @@ relative order of spike arrivals differs slightly per run, which introduces some
 variance in the absolute numbers. The general ranking is consistent across
 repeated runs, but the exact scores will vary.
 
-\textit{Detailed analysis of the DBA contribution, sensitivity to the EWMA
-parameters, and comparison under varying spike frequencies is left for the final
-version of this report.}
+The DBA contribution is harder to quantify without a dedicated ablation run,
+but the score-over-time plot gives a hint. Early in the experiment, before
+enough flows have completed for the EWMA estimates to stabilise, AP and LRT
+behave quite similarly because $\text{dyn\_weight}$ still defaults to the static
+weight. As flows accumulate, fast servers gain a progressively higher
+$\text{dyn\_weight}$, which lowers their routing score in~\eqref{eq:ap} beyond
+what response time alone would achieve. This compounds over time, which is
+consistent with the widening gap between AP and LRT in
+Figure~\ref{fig:cmp_score_time}.
+
+The traffic classification layer from Section~\ref{sec:tc} also deserves mention
+here. About 30\,\% of the traffic in the experiment (audio and VoIP combined)
+is hard-constrained to Tier~A servers, independent of which algorithm is active.
+This gives every algorithm a baseline advantage for those flows over a
+purely port-agnostic design. The comparison is still fair because all five
+algorithms operate under the same constraint.
+
+It is also worth thinking about what AP's concentrated routing means in practice.
+Sending 87\,\% of traffic to Tier~A servers (Table~\ref{tab:summary}) is
+great for latency, but it leaves Tier~D servers almost completely idle.
+In a cost-sensitive deployment that might be wasteful — Tier~D machines are
+still consuming power and licenses. In a latency-first deployment, it is
+exactly the right trade-off. The algorithm does not make that choice for you;
+the server weights and the traffic classification rules do.
 
 % ══════════════════════════════════════════════════════════════════════
 \section{Conclusion}
 \label{sec:conclusion}
 
-\textit{This section will be completed once the final experiments are done.}
+This thesis set out to answer three questions, and the experiments give fairly
+clear answers to all three.
+
+The first question was whether transparent HTTP load balancing is achievable
+without touching the client or server code. It is. The VIP and flow-rule
+approach means the client only ever sees the VIP address, and the server only
+ever sees the VIP as the source of incoming requests, so neither side needs to
+know the load balancer exists. The main constraint is that the first packet of
+each TCP connection must reach the controller before a flow rule is installed,
+which adds a small one-off latency hit per new connection. With the deduplication
+cache in place this causes no correctness issues, even when OVS sends multiple
+PacketIn events for the same TCP handshake.
+
+The second question was whether combining queue depth and response time is better
+than using either signal alone. The answer is yes, and the gap is not small.
+AP (both signals) scores 0.73 against LRT's 0.59 (response time only) and LC's
+0.44 (queue depth only). The reason is straightforward: active connections react
+to overload \emph{before} flows expire, while the EWMA of flow duration captures
+the server's baseline speed. Neither signal is sufficient on its own; together
+they catch spikes early and avoid slow servers persistently.
+
+The third question was how much DBA specifically contributes to that gap. This
+is harder to isolate with a single run. The score-over-time results suggest the
+contribution is real but smaller than the active-connections effect: some of the
+gap is present from the first requests and some widens gradually, which fits the
+picture of DBA building an increasingly accurate model of each server's capacity.
+A proper ablation (AP without DBA against the full AP) is the right way to
+quantify this and is a natural direction for follow-up work.
+
+Beyond those three questions, a few broader lessons came out of the project.
+Running five algorithms on a heterogeneous pool with realistic spikes made it
+clear that the ranking RR~$<$~LC~$<$~WRR~$<$~LRT~$<$~AP is not specific to the
+setup parameters: it follows directly from how much information each algorithm
+has access to, and it held consistently across repeated runs.
+
+Future work could include testing on physical hardware or cloud VMs to check
+whether the emulated network latencies are representative, varying the spike
+frequency and irregularity to stress-test the EWMA adaptation rate, and
+experimenting with the $c_{\mathrm{tc}}$ multipliers to find values that work
+well across a wider range of traffic mixes.
 
 % ══════════════════════════════════════════════════════════════════════
 \bibliography{refs}

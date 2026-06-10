@@ -1,6 +1,3 @@
-# Classify traffic by destination port so we can route latency-sensitive
-# flows (VoIP, audio) to faster servers and mark them with the right DSCP.
-
 from __future__ import annotations
 
 from typing import Sequence
@@ -14,7 +11,6 @@ class TrafficClass:
     VOIP  = "voip"
 
 
-# map destination port to traffic class
 _PORT_MAP: dict[int, str] = {
     80:   TrafficClass.HTTP,
     8000: TrafficClass.HTTP,
@@ -24,12 +20,12 @@ _PORT_MAP: dict[int, str] = {
     1935: TrafficClass.VIDEO,
     8554: TrafficClass.VIDEO,
     1755: TrafficClass.AUDIO,
-    8080: TrafficClass.AUDIO,
+    8080: TrafficClass.HTTP,
     5060: TrafficClass.VOIP,
     5061: TrafficClass.VOIP,
 }
 
-# DSCP values from RFC 4594 - these go into the IP header
+# DSCP values from RFC 4594
 DSCP: dict[str, int] = {
     TrafficClass.VOIP:  46,   # EF
     TrafficClass.AUDIO: 34,   # AF41
@@ -38,17 +34,16 @@ DSCP: dict[str, int] = {
     TrafficClass.HTTP:   0,   # best effort
 }
 
-# how much of the server pool each traffic class is allowed to use.
-# VoIP only goes to the fastest servers; HTTP can go anywhere.
+# VoIP/Audio → top 20% (Tier A), Video → top 50% (Tier A+B), rest → all
 _POOL_FRACTION: dict[str, float] = {
-    TrafficClass.VOIP:  0.40,
-    TrafficClass.AUDIO: 0.40,
-    TrafficClass.VIDEO: 0.70,
+    TrafficClass.VOIP:  0.20,
+    TrafficClass.AUDIO: 0.20,
+    TrafficClass.VIDEO: 0.50,
     TrafficClass.MAPS:  1.00,
     TrafficClass.HTTP:  1.00,
 }
 
-# traffic mix for the experiments - (class, vip_port, cumulative probability)
+# (class, vip_port, cumulative probability) for the experiment traffic mix
 TRAFFIC_MIX_CUM = [
     (TrafficClass.HTTP,  8000, 0.35),
     (TrafficClass.MAPS,   443, 0.50),
@@ -59,18 +54,15 @@ TRAFFIC_MIX_CUM = [
 
 
 def classify_traffic(dst_port: int, proto: int = 6) -> str:
-    """Figure out what kind of traffic this is from the destination port."""
     if proto == 17:
-        # RTP (VoIP media) uses this port range
+        # RTP uses this port range
         if 16384 <= dst_port <= 32767:
             return TrafficClass.VOIP
     return _PORT_MAP.get(dst_port, TrafficClass.HTTP)
 
 
 def server_pool(servers: Sequence, traffic_class: str) -> list:
-    """Return which servers are allowed to handle this traffic class.
-    Higher priority = only the faster servers.
-    """
+    """Restrict the pool to servers allowed for this traffic class."""
     frac = _POOL_FRACTION.get(traffic_class, 1.0)
     if frac >= 1.0:
         return list(servers)

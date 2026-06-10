@@ -51,9 +51,9 @@ def server_tier(server_name):
     """Returns the tier letter (A/B/C/D) for a given server hostname based on its index."""
     idx = int(server_name[1:]) - 2  # h2 -> 0, h3 -> 1, ...
     n = _num_servers
-    if idx < n * 0.4:
+    if idx < n * 0.2:
         return "A"
-    elif idx < n * 0.6:
+    elif idx < n * 0.5:
         return "B"
     elif idx < n * 0.8:
         return "C"

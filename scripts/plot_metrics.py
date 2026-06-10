@@ -133,9 +133,9 @@ def _server_tier(name):
     """Returns the tier letter for a server hostname."""
     idx = int(name[1:]) - 2
     n = _num_servers
-    if idx < n * 0.4:
+    if idx < n * 0.2:
         return "A"
-    elif idx < n * 0.6:
+    elif idx < n * 0.5:
         return "B"
     elif idx < n * 0.8:
         return "C"
@@ -170,7 +170,7 @@ def plot_request_distribution(requests, out_dir):
     # Tier boundary markers
     n = _num_servers
     for boundary, label in [
-        (int(n * 0.4), "A|B"), (int(n * 0.6), "B|C"), (int(n * 0.8), "C|D")
+        (int(n * 0.2), "A|B"), (int(n * 0.5), "B|C"), (int(n * 0.8), "C|D")
     ]:
         ax.axvline(boundary - 0.5, color="gray", linestyle=":", linewidth=1.0)
         ax.text(boundary - 0.5, ax.get_ylim()[1] * 0.95,

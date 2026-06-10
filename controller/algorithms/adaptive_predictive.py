@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-# My adaptive predictive algorithm - the main contribution of this thesis.
-# Basic idea: combine response time and active connections into one score,
-# but also learn weights over time so fast servers get picked more often.
-
 import random
 import time
 from typing import Sequence
@@ -18,15 +14,15 @@ except ImportError:
     from traffic import server_pool, TrafficClass  # type: ignore[no-redef]
 
 _DYN_ALPHA_FAST = 0.60   # learn quickly at the start
-_DYN_ALPHA_SLOW = 0.20   # slow down once we have enough data
-_MIN_DUR        = 0.001  # avoid dividing by zero
-_FLOOR_FRAC     = 0.05   # don't let the learned weight drop too low
-_STALE_SECS     = 4.0    # re-probe a server if we haven't used it in 4s
-_BOOTSTRAP_N    = 5      # need at least 5 flows before trusting a server's weight
-_DYN_POOL_FRAC  = 0.08   # exclude servers whose learned weight is < 8% of the best
+_DYN_ALPHA_SLOW = 0.20   # stable rate once we have enough data
+_MIN_DUR        = 0.001
+_FLOOR_FRAC     = 0.05   # dyn_weight floor: 5% of static weight
+_STALE_SECS     = 4.0    # re-probe a server we haven't touched in 4s
+_BOOTSTRAP_N    = 5      # flows needed before we trust a server's weight
+_DYN_POOL_FRAC  = 0.08   # drop servers below 8% of best known weight
 _EPSILON        = 1e-9
 
-# VOIP and audio are more sensitive to latency so we penalize busy servers harder
+# latency-sensitive classes get a heavier penalty for busy servers
 _AC_MULT: dict[str, float] = {
     TrafficClass.VOIP:  3.0,
     TrafficClass.AUDIO: 2.0,
@@ -37,10 +33,6 @@ _AC_MULT: dict[str, float] = {
 
 
 class AdaptivePredictiveAlgorithm(LoadBalancingAlgorithm):
-    """
-    Picks servers based on response time and active connections,
-    but also learns which servers are fast over time.
-    """
 
     name = "adaptive_predictive"
 
@@ -51,7 +43,7 @@ class AdaptivePredictiveAlgorithm(LoadBalancingAlgorithm):
         self._last_selected: dict[str, float] = {}
 
     def _dw(self, server: ServerMetrics) -> float:
-        # use static weight until we've seen enough flows
+        # fall back to static weight until we have real data
         return self._dyn_weight.get(server.name, server.weight)
 
     def select(self, servers: Sequence[ServerMetrics], traffic_class: str = "http") -> ServerMetrics:
@@ -59,8 +51,7 @@ class AdaptivePredictiveAlgorithm(LoadBalancingAlgorithm):
         now = time.monotonic()
         ac_mult = _AC_MULT.get(traffic_class, 1.0)
 
-        # once we have data on enough servers, stop sending requests to the
-        # ones we already know are slow
+        # once enough servers are profiled, cut out the known slow ones
         learned = [s for s in pool
                    if self._flow_count.get(s.name, 0) >= _BOOTSTRAP_N]
         if len(learned) >= len(pool) // 2:
@@ -77,10 +68,9 @@ class AdaptivePredictiveAlgorithm(LoadBalancingAlgorithm):
 
             count = self._flow_count.get(s.name, 0)
             if count < _BOOTSTRAP_N:
-                # not measured yet - give it a probe occasionally so we get data
                 last = self._last_selected.get(s.name, 0.0)
                 if now - last > _STALE_SECS:
-                    return 0.0
+                    return 0.0  # force a probe
             return actual
 
         scores    = [_score(s) for s in pool]
@@ -95,7 +85,6 @@ class AdaptivePredictiveAlgorithm(LoadBalancingAlgorithm):
         dur  = max(server.avg_flow_dur_s, _MIN_DUR)
         name = server.name
 
-        # faster servers get a higher target weight
         target = server.weight / dur
         target = max(target, server.weight * _FLOOR_FRAC)
 

@@ -30,5 +30,3 @@ def get_algorithm(name: str) -> LoadBalancingAlgorithm:
             f"unknown algorithm {name!r}; available: {available_algorithms()}"
         ) from exc
     return cls()
-
-    return cls()

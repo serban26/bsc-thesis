@@ -73,7 +73,7 @@ NUM_CLIENTS=$(ask "Number of clients" "10")
 # fair static baseline for comparison against the dynamic algorithms.
 WEIGHTS=$(python3 - <<PYEOF
 n, max_w = $NUM_SERVERS, $MAX_WEIGHT
-thresholds = (0.40, 0.70, 0.90)
+thresholds = (0.20, 0.50, 0.80)
 weights = []
 for i in range(n):
     frac = i / max(n - 1, 1)
